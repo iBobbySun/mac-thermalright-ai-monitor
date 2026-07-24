@@ -12,6 +12,7 @@ import Observation
 
 extension Notification.Name {
     static let deviceStateChanged = Notification.Name("deviceStateChanged")
+    static let displaySettingsChanged = Notification.Name("displaySettingsChanged")
 }
 
 enum DisplaySet: String, CaseIterable, Identifiable, Sendable {
@@ -36,6 +37,9 @@ final class AppState {
     var brightness: Int = 5
     var refreshInterval: Double = 0.5
     var rotateDisplay: Bool = false
+    var showClaudeAgent: Bool
+    var showCodexAgent: Bool
+    var agentLayoutDirection: AgentLayoutDirection
 
     // Metrics (for menu bar display)
     var frameCount = 0
@@ -46,6 +50,13 @@ final class AppState {
     private var engine: DisplayEngine?
 
     // MARK: - Lifecycle
+
+    init() {
+        let agentDisplay = AgentDisplayConfig.load()
+        showClaudeAgent = agentDisplay.showClaude
+        showCodexAgent = agentDisplay.showCodex
+        agentLayoutDirection = agentDisplay.layoutDirection
+    }
 
     func start() {
         let eng = DisplayEngine { [weak self] status in
@@ -66,7 +77,8 @@ final class AppState {
             }
         }
         engine = eng
-        eng.start(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+        eng.start(set: currentSet, brightness: brightness, interval: refreshInterval,
+                  rotate: rotateDisplay, agentDisplay: agentDisplayConfig)
     }
 
     func stop() {
@@ -89,12 +101,35 @@ final class AppState {
 
     /// Called when user changes display set, brightness, or interval
     func applySettings() {
-        engine?.updateSettings(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+        normalizeAgentDisplaySettings()
+        agentDisplayConfig.save()
+        engine?.updateSettings(set: currentSet, brightness: brightness, interval: refreshInterval,
+                               rotate: rotateDisplay, agentDisplay: agentDisplayConfig)
+        NotificationCenter.default.post(name: .displaySettingsChanged, object: nil)
     }
 
     /// Latest rendered frame for the on-Mac preview window
     func currentFrame() -> CGImage? {
         engine?.currentFrame()
+    }
+
+    var frameSize: NSSize {
+        let layout = DashboardLayout(agentDisplay: agentDisplayConfig)
+        return NSSize(width: layout.width, height: layout.height)
+    }
+
+    private var agentDisplayConfig: AgentDisplayConfig {
+        AgentDisplayConfig(
+            showClaude: showClaudeAgent,
+            showCodex: showCodexAgent,
+            layoutDirection: agentLayoutDirection).normalized
+    }
+
+    private func normalizeAgentDisplaySettings() {
+        let normalized = agentDisplayConfig
+        showClaudeAgent = normalized.showClaude
+        showCodexAgent = normalized.showCodex
+        agentLayoutDirection = normalized.layoutDirection
     }
 }
 
@@ -125,6 +160,7 @@ final class DisplayEngine: @unchecked Sendable {
     private var brightness: Int = 5
     private var interval: Double = 0.5
     private var rotateDisplay: Bool = false
+    private var agentDisplayConfig = AgentDisplayConfig.defaultValue
 
     // Renderers
     private let monitorRenderer = MonitorRenderer()
@@ -133,11 +169,14 @@ final class DisplayEngine: @unchecked Sendable {
         self.statusCallback = statusCallback
     }
 
-    func start(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool) {
+    func start(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool,
+               agentDisplay: AgentDisplayConfig) {
         self.currentSet = set
         self.brightness = brightness
         self.interval = interval
         self.rotateDisplay = rotate
+        self.agentDisplayConfig = agentDisplay.normalized
+        monitorRenderer.updateAgentDisplay(agentDisplay)
 
         usbQueue.async { [weak self] in
             guard let self else { return }
@@ -171,12 +210,15 @@ final class DisplayEngine: @unchecked Sendable {
         monitorRenderer.render()
     }
 
-    func updateSettings(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool) {
-        log("[Engine] Settings updated: set=\(set.rawValue), brightness=\(brightness), interval=\(interval), rotate=\(rotate)")
+    func updateSettings(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool,
+                        agentDisplay: AgentDisplayConfig) {
+        log("[Engine] Settings updated: set=\(set.rawValue), brightness=\(brightness), interval=\(interval), rotate=\(rotate), agents=\(agentDisplay.visibleAgents.map(\.rawValue).joined(separator: ",")), dashboardLayout=\(agentDisplay.layoutDirection.rawValue)")
         self.currentSet = set
         self.brightness = brightness
         self.interval = interval
         self.rotateDisplay = rotate
+        self.agentDisplayConfig = agentDisplay.normalized
+        monitorRenderer.updateAgentDisplay(agentDisplay)
     }
 
     // MARK: - Private (all on usbQueue)

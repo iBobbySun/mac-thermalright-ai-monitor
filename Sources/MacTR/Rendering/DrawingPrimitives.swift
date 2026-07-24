@@ -13,7 +13,7 @@ enum Draw {
 
     /// Draw vertical gradient background.
     /// In flipped context: Y=0 is top, so bgTop at y=0, bgBot at y=height.
-    static func gradientBackground(_ ctx: CGContext) {
+    static func gradientBackground(_ ctx: CGContext, height: Int = Layout.height) {
         let colors = [Color.bgTop, Color.bgBot] as CFArray
         guard let gradient = CGGradient(
             colorsSpace: CGColorSpaceCreateDeviceRGB(),
@@ -23,10 +23,10 @@ enum Draw {
         ctx.saveGState()
         // Undo flip for gradient (drawLinearGradient uses native CG coords)
         ctx.scaleBy(x: 1, y: -1)
-        ctx.translateBy(x: 0, y: -CGFloat(Layout.height))
+        ctx.translateBy(x: 0, y: -CGFloat(height))
         ctx.drawLinearGradient(
             gradient,
-            start: CGPoint(x: 0, y: CGFloat(Layout.height)),
+            start: CGPoint(x: 0, y: CGFloat(height)),
             end: CGPoint(x: 0, y: 0),
             options: [])
         ctx.restoreGState()

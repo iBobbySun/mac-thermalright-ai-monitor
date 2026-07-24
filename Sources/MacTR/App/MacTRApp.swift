@@ -16,6 +16,47 @@ func log(_ message: String) {
     mactrLogger.info("\(message, privacy: .public)")
 }
 
+@MainActor
+private enum PreviewAlwaysOnTop {
+    private static let defaultsKey = "previewWindowAlwaysOnTop"
+
+    static var isEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: defaultsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: defaultsKey) }
+    }
+
+    static func apply(to window: NSWindow?) {
+        window?.level = isEnabled ? .floating : .normal
+    }
+
+    static func addTitlebarToggle(to window: NSWindow, target: AnyObject, action: Selector) -> NSButton {
+        let button = NSButton(checkboxWithTitle: "置顶", target: target, action: action)
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        button.toolTip = "始终在最前面显示预览窗口"
+        button.state = isEnabled ? .on : .off
+        button.sizeToFit()
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .right
+        accessory.view = button
+        window.addTitlebarAccessoryViewController(accessory)
+        return button
+    }
+
+    static func sync(_ button: NSButton?) {
+        button?.state = isEnabled ? .on : .off
+    }
+}
+
+private func previewContentSize(for frameSize: NSSize) -> NSSize {
+    NSSize(width: frameSize.width / 2, height: frameSize.height / 2)
+}
+
+private func imageSize(_ image: CGImage) -> NSSize {
+    NSSize(width: image.width, height: image.height)
+}
+
 // MARK: - App Entry Point
 
 @main
@@ -49,6 +90,7 @@ struct MacTREntry {
         // Usage: --snapshot path.png [--cores N]
         if CommandLine.arguments.contains("--snapshot") {
             let renderer = MonitorRenderer()
+            renderer.updateAgentDisplay(agentDisplayConfig(from: CommandLine.arguments))
             let simCores = parseFlag(CommandLine.arguments, flag: "--cores")
 
             // Prime metrics collection (required for real data render)
@@ -104,19 +146,25 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var imageView: NSImageView!
     private let renderer = MonitorRenderer()
     private var timer: Timer?
+    private var alwaysOnTopButton: NSButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("[Preview] Starting preview window (no LCD)")
 
-        // Half-scale window keeps the 1920x480 frame readable on a laptop screen
-        let contentSize = NSSize(width: Layout.width / 2, height: Layout.height / 2)
+        // Half-scale keeps the dashboard readable on a laptop screen.
+        renderer.updateAgentDisplay(agentDisplayConfig(from: CommandLine.arguments))
+        let frameSize = renderer.frameSize()
+        let contentSize = previewContentSize(for: frameSize)
         window = NSWindow(
             contentRect: NSRect(origin: .zero, size: contentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
-        window.title = "MacTR Preview — \(Layout.width)x\(Layout.height)"
-        window.contentAspectRatio = NSSize(width: Layout.width, height: Layout.height)
+        window.title = "MacTR Preview — \(Int(frameSize.width))x\(Int(frameSize.height))"
+        window.contentAspectRatio = frameSize
         window.delegate = self
+        PreviewAlwaysOnTop.apply(to: window)
+        alwaysOnTopButton = PreviewAlwaysOnTop.addTitlebarToggle(
+            to: window, target: self, action: #selector(toggleAlwaysOnTopFromWindow))
 
         imageView = NSImageView(frame: NSRect(origin: .zero, size: contentSize))
         imageView.imageScaling = .scaleProportionallyUpOrDown
@@ -141,8 +189,13 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     private func refresh() {
         guard let image = renderer.render() else { return }
-        imageView.image = NSImage(cgImage: image,
-                                  size: NSSize(width: Layout.width, height: Layout.height))
+        imageView.image = NSImage(cgImage: image, size: imageSize(image))
+    }
+
+    @objc private func toggleAlwaysOnTopFromWindow(_ sender: NSButton) {
+        PreviewAlwaysOnTop.isEnabled = sender.state == .on
+        PreviewAlwaysOnTop.apply(to: window)
+        PreviewAlwaysOnTop.sync(alwaysOnTopButton)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -177,6 +230,8 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var statusMenuItem: NSMenuItem!
     private var versionMenuItem: NSMenuItem!
     private var reconnectItem: NSMenuItem!
+    private var previewAlwaysOnTopItem: NSMenuItem!
+    private var previewAlwaysOnTopButton: NSButton?
     private var updateTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -196,9 +251,21 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         NotificationCenter.default.addObserver(
             forName: .deviceStateChanged, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.updateIcon()
-            self?.updateMenuItems()
-            self?.updatePreviewForConnection()
+            Task { @MainActor in
+                self?.updateIcon()
+                self?.updateMenuItems()
+                self?.updatePreviewForConnection()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .displaySettingsChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateMenuItems()
+                self?.resizePreviewForCurrentSettings()
+                self?.refreshPreview()
+            }
         }
 
         // Start engine
@@ -337,6 +404,13 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         previewItem.target = self
         menu.addItem(previewItem)
 
+        previewAlwaysOnTopItem = NSMenuItem(
+            title: "Always on Top",
+            action: #selector(togglePreviewAlwaysOnTopFromMenu),
+            keyEquivalent: "t")
+        previewAlwaysOnTopItem.target = self
+        menu.addItem(previewAlwaysOnTopItem)
+
         menu.addItem(.separator())
 
         // Check for Updates
@@ -369,6 +443,9 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         // Reconnect visibility
         reconnectItem.isHidden = appState.isConnected
+
+        previewAlwaysOnTopItem.state = PreviewAlwaysOnTop.isEnabled ? .on : .off
+        PreviewAlwaysOnTop.sync(previewAlwaysOnTopButton)
     }
 
     // MARK: - Preview Window (auto-fallback when LCD is disconnected)
@@ -383,15 +460,18 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func showPreview() {
         if previewWindow == nil {
-            let contentSize = NSSize(width: Layout.width / 2, height: Layout.height / 2)
+            let contentSize = previewContentSize(for: appState.frameSize)
             let window = NSWindow(
                 contentRect: NSRect(origin: .zero, size: contentSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered, defer: false)
             window.title = "MacTR — LCD 未连接，本机预览中"
-            window.contentAspectRatio = NSSize(width: Layout.width, height: Layout.height)
+            window.contentAspectRatio = appState.frameSize
             window.isReleasedWhenClosed = false
             window.delegate = self
+            PreviewAlwaysOnTop.apply(to: window)
+            previewAlwaysOnTopButton = PreviewAlwaysOnTop.addTitlebarToggle(
+                to: window, target: self, action: #selector(togglePreviewAlwaysOnTopFromWindow))
 
             let imageView = NSImageView(frame: NSRect(origin: .zero, size: contentSize))
             imageView.imageScaling = .scaleProportionallyUpOrDown
@@ -402,6 +482,9 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             previewWindow = window
             previewImageView = imageView
         }
+        resizePreviewForCurrentSettings()
+        PreviewAlwaysOnTop.apply(to: previewWindow)
+        PreviewAlwaysOnTop.sync(previewAlwaysOnTopButton)
         previewWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -422,12 +505,35 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func refreshPreview() {
         guard let image = appState.currentFrame() else { return }
-        previewImageView?.image = NSImage(
-            cgImage: image, size: NSSize(width: Layout.width, height: Layout.height))
+        previewImageView?.image = NSImage(cgImage: image, size: imageSize(image))
+    }
+
+    private func resizePreviewForCurrentSettings() {
+        guard let previewWindow else { return }
+        let frameSize = appState.frameSize
+        let contentSize = previewContentSize(for: frameSize)
+        previewWindow.contentAspectRatio = frameSize
+        previewWindow.setContentSize(contentSize)
+        previewImageView?.frame = NSRect(origin: .zero, size: contentSize)
     }
 
     @objc private func showPreviewManually() {
         showPreview()
+    }
+
+    @objc private func togglePreviewAlwaysOnTopFromMenu() {
+        setPreviewAlwaysOnTop(!PreviewAlwaysOnTop.isEnabled)
+    }
+
+    @objc private func togglePreviewAlwaysOnTopFromWindow(_ sender: NSButton) {
+        setPreviewAlwaysOnTop(sender.state == .on)
+    }
+
+    private func setPreviewAlwaysOnTop(_ enabled: Bool) {
+        PreviewAlwaysOnTop.isEnabled = enabled
+        PreviewAlwaysOnTop.apply(to: previewWindow)
+        previewAlwaysOnTopItem.state = enabled ? .on : .off
+        PreviewAlwaysOnTop.sync(previewAlwaysOnTopButton)
     }
 
     // User closed the preview window — stop rendering to it; reopen via the
@@ -451,7 +557,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let window = NSWindow(contentViewController: hostingController)
         window.title = "MacTR Settings"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 450, height: 350))
+        window.setContentSize(NSSize(width: 500, height: 430))
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -514,6 +620,7 @@ private func runBenchmark() {
     catch { print("[Bench][ERROR] handshake failed: \(error)"); return }
 
     let renderer = MonitorRenderer()
+    renderer.updateAgentDisplay(agentDisplayConfig(from: args))
     renderer.startMetrics()
     Thread.sleep(forTimeInterval: 1.0)  // prime metrics so render() returns frames
 
@@ -582,11 +689,14 @@ private func runGif() {
     let frames = parseFlag(args, flag: "--frames") ?? 40
     let fps = parseFlag(args, flag: "--fps") ?? 12
     let scale = max(1, parseFlag(args, flag: "--scale") ?? 2)
-    let outW = Layout.width / scale, outH = Layout.height / scale
     let delay = 1.0 / Double(fps)
 
     let renderer = MonitorRenderer()
+    renderer.updateAgentDisplay(agentDisplayConfig(from: args))
     renderer.demoMode = true
+    let frameSize = renderer.frameSize()
+    let outW = Int(frameSize.width) / scale
+    let outH = Int(frameSize.height) / scale
 
     let url = URL(fileURLWithPath: path) as CFURL
     guard let dest = CGImageDestinationCreateWithURL(url, "com.compuserve.gif" as CFString,
@@ -646,6 +756,7 @@ private func runDemo() {
     catch { print("[Demo][ERROR] handshake failed: \(error)"); return }
 
     let renderer = MonitorRenderer()
+    renderer.updateAgentDisplay(agentDisplayConfig(from: CommandLine.arguments))
     renderer.demoMode = true                 // fake data; no real metrics needed
     print("[Demo] Sending demo frames at 15fps (Ctrl+C to stop)...")
     signal(SIGINT, SIG_DFL)
@@ -698,6 +809,7 @@ private func runCLI() {
         cliFrameLoop(device: device, staticJPEG: jpeg)
     } else {
         let renderer = MonitorRenderer()
+        renderer.updateAgentDisplay(agentDisplayConfig(from: args))
         renderer.startMetrics()
         Thread.sleep(forTimeInterval: 0.3)
 
@@ -748,6 +860,32 @@ private func cliFrameLoop(device: USBDevice, staticJPEG: Data) {
 private func parseFlag(_ args: [String], flag: String) -> Int? {
     guard let idx = args.firstIndex(of: flag), idx + 1 < args.count else { return nil }
     return Int(args[idx + 1])
+}
+
+private func parseStringFlag(_ args: [String], flag: String) -> String? {
+    guard let idx = args.firstIndex(of: flag), idx + 1 < args.count else { return nil }
+    return args[idx + 1]
+}
+
+private func agentDisplayConfig(from args: [String]) -> AgentDisplayConfig {
+    var config = AgentDisplayConfig.load()
+    if let agents = parseStringFlag(args, flag: "--agents")?.lowercased() {
+        let parts = Set(agents.split(separator: ",").map { String($0.trimmingCharacters(in: .whitespaces)) })
+        if parts.contains("both") || parts.contains("all") {
+            config.showClaude = true
+            config.showCodex = true
+        } else {
+            config.showClaude = parts.contains("claude")
+            config.showCodex = parts.contains("codex")
+        }
+    }
+    let layoutFlag = parseStringFlag(args, flag: "--dashboard-layout")
+        ?? parseStringFlag(args, flag: "--agent-layout")
+    if let layout = layoutFlag?.lowercased(),
+       let direction = AgentLayoutDirection(rawValue: layout) {
+        config.layoutDirection = direction
+    }
+    return config.normalized
 }
 
 // MARK: - Test Image

@@ -27,7 +27,7 @@ struct SettingsView: View {
                 aboutView
             }
         }
-        .frame(width: 480, height: 340)
+        .frame(width: 500, height: 430)
     }
 
     // MARK: - General Tab
@@ -87,6 +87,35 @@ struct SettingsView: View {
                     state.applySettings()
                 }
                 Text("1 = original, 10 = maximum")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Dashboard Layout") {
+                Picker("Orientation", selection: $state.agentLayoutDirection) {
+                    Text("Horizontal").tag(AgentLayoutDirection.horizontal)
+                    Text("Vertical").tag(AgentLayoutDirection.vertical)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: state.agentLayoutDirection) {
+                    state.applySettings()
+                }
+
+                Text("Vertical stacks CPU, Agents, and Memory from top to bottom.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("AI Agents") {
+                Toggle("Show Claude", isOn: $state.showClaudeAgent)
+                    .onChange(of: state.showClaudeAgent) {
+                        state.applySettings()
+                    }
+                Toggle("Show Codex", isOn: $state.showCodexAgent)
+                    .onChange(of: state.showCodexAgent) {
+                        state.applySettings()
+                    }
+                Text("Codex stays visible if both agents are turned off.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

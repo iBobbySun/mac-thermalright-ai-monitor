@@ -5,6 +5,7 @@
 
 import AppKit
 import CoreGraphics
+import Foundation
 
 // MARK: - Colors
 
@@ -73,6 +74,124 @@ enum Layout {
     static func panelX(_ index: Int) -> Int {
         margin + index * (panelWidth + gap)
     }
+}
+
+enum AgentKind: String, CaseIterable, Identifiable, Sendable {
+    case claude
+    case codex
+
+    var id: String { rawValue }
+}
+
+enum AgentLayoutDirection: String, CaseIterable, Identifiable, Sendable {
+    case horizontal
+    case vertical
+
+    var id: String { rawValue }
+}
+
+struct AgentDisplayConfig: Equatable, Sendable {
+    private enum DefaultsKey {
+        static let showClaude = "agentDisplay.showClaude"
+        static let showCodex = "agentDisplay.showCodex"
+        static let layoutDirection = "agentDisplay.layoutDirection"
+    }
+
+    var showClaude: Bool
+    var showCodex: Bool
+    var layoutDirection: AgentLayoutDirection
+
+    static let defaultValue = AgentDisplayConfig(
+        showClaude: false,
+        showCodex: true,
+        layoutDirection: .horizontal)
+
+    var normalized: AgentDisplayConfig {
+        if showClaude || showCodex { return self }
+        return AgentDisplayConfig(showClaude: false, showCodex: true, layoutDirection: layoutDirection)
+    }
+
+    var visibleAgents: [AgentKind] {
+        let config = normalized
+        var agents: [AgentKind] = []
+        if config.showClaude { agents.append(.claude) }
+        if config.showCodex { agents.append(.codex) }
+        return agents
+    }
+
+    static func load() -> AgentDisplayConfig {
+        let defaults = UserDefaults.standard
+        let showClaude = defaults.object(forKey: DefaultsKey.showClaude) as? Bool
+            ?? defaultValue.showClaude
+        let showCodex = defaults.object(forKey: DefaultsKey.showCodex) as? Bool
+            ?? defaultValue.showCodex
+        let layoutDirection = (defaults.string(forKey: DefaultsKey.layoutDirection)
+            .flatMap(AgentLayoutDirection.init(rawValue:))) ?? defaultValue.layoutDirection
+        return AgentDisplayConfig(
+            showClaude: showClaude,
+            showCodex: showCodex,
+            layoutDirection: layoutDirection).normalized
+    }
+
+    func save() {
+        let config = normalized
+        let defaults = UserDefaults.standard
+        defaults.set(config.showClaude, forKey: DefaultsKey.showClaude)
+        defaults.set(config.showCodex, forKey: DefaultsKey.showCodex)
+        defaults.set(config.layoutDirection.rawValue, forKey: DefaultsKey.layoutDirection)
+    }
+}
+
+struct DashboardLayout: Sendable {
+    let agentDisplay: AgentDisplayConfig
+
+    var visibleAgents: [AgentKind] { agentDisplay.visibleAgents }
+    var isVertical: Bool { agentDisplay.layoutDirection == .vertical }
+    var agentPanelSlots: Int {
+        visibleAgents.count <= 1 || isVertical ? 2 : 3
+    }
+    var naturalAgentsWidth: Int {
+        agentPanelSlots * Layout.panelWidth + (agentPanelSlots - 1) * Layout.gap
+    }
+    var totalPanelSlots: Int { 2 + agentPanelSlots }
+    var verticalWidth: Int {
+        let currentVerticalWidth = 2 * Layout.margin + naturalAgentsWidth
+        return Int((Double(currentVerticalWidth) * 2.0 / 3.0).rounded())
+    }
+    var width: Int {
+        if isVertical {
+            return verticalWidth
+        }
+        return Layout.width - (Layout.panelCount - totalPanelSlots) * (Layout.panelWidth + Layout.gap)
+    }
+    var height: Int {
+        if isVertical {
+            return 2 * Layout.margin + 3 * Layout.panelHeight + 2 * Layout.gap
+        }
+        return Layout.height
+    }
+
+    func panelX(_ index: Int) -> Int {
+        Layout.panelX(index)
+    }
+
+    func panelY(_ row: Int) -> Int {
+        Layout.margin + row * (Layout.panelHeight + Layout.gap)
+    }
+
+    var contentX: Int { Layout.margin }
+    var contentWidth: Int { isVertical ? verticalWidth - 2 * Layout.margin : naturalAgentsWidth }
+    var cpuX: Int { isVertical ? contentX : panelX(0) }
+    var cpuY: Int { isVertical ? panelY(0) : Layout.panelY }
+    var cpuWidth: Int { isVertical ? contentWidth : Layout.panelWidth }
+    var agentsX: Int { isVertical ? contentX : panelX(1) }
+    var agentsY: Int { isVertical ? panelY(1) : Layout.panelY }
+    var agentsWidth: Int {
+        isVertical ? contentWidth : naturalAgentsWidth
+    }
+    var memoryX: Int { isVertical ? contentX : panelX(1 + agentPanelSlots) }
+    var memoryY: Int { isVertical ? panelY(2) : Layout.panelY }
+    var memoryWidth: Int { isVertical ? contentWidth : Layout.panelWidth }
 }
 
 // MARK: - Fonts
