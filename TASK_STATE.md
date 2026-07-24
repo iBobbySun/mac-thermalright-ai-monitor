@@ -68,11 +68,11 @@
 - 未解决问题：release 构建仍有既有 warning（Info.plist resource 声明、素材文件 `nonisolated(unsafe)`、libusb deployment target 提示），本次未处理。
 - 验证结果：`swift build` 通过；`swift build -c release` 通过；`git diff --check` 通过；已生成并目检 `/tmp/mactr-dashboard-vertical-codex-narrow.png` 和 `/tmp/mactr-dashboard-vertical-both-narrow.png`，确认尺寸为 `519x1404` 且 Agent 面板无横向裁切。
 
-## 2026-07-24 提交与推送准备
+## 2026-07-24 提交与推送
 
-- 完成内容：检查待提交变更并准备提交到 Git。
+- 完成内容：检查待提交变更，提交到本地 Git，并推送到用户指定远端。
 - 关键决策：当前 `origin` 指向 `m1ng-li/mac-thermalright-ai-monitor`，本次按用户要求直接 push 到 `iBobbySun/mac-thermalright-ai-monitor`，不修改本地 remote 配置。
 - 修改文件：
   - `TASK_STATE.md`
-- 未解决问题：提交后仍需执行实际 push。
-- 验证结果：`git diff --check` 通过；`swift build -c release` 通过。
+- 未解决问题：本地 `origin` 仍指向旧仓库，因此 `git status` 相对 `origin/main` 仍显示 ahead；目标仓库 `iBobbySun/mac-thermalright-ai-monitor` 已推送成功。
+- 验证结果：`git diff --check` 通过；`swift build -c release` 通过；已 push 到 `https://github.com/iBobbySun/mac-thermalright-ai-monitor.git`，远端 `main` readback 成功。
