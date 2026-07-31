@@ -1,5 +1,14 @@
 # TASK_STATE
 
+## 2026-07-31 提交并推送内存修复
+
+- 完成内容：将内存增长、生命周期竞态、USB/SMC 资源释放及此前预览标题栏调整提交为 `0cf667b`；在本地新增 `fork` 远端，并将 `main` 推送到 `iBobbySun/mac-thermalright-ai-monitor`。
+- 关键决策：保留 `origin` 指向上游 `m1ng-li/mac-thermalright-ai-monitor`；由于当前 GitHub 账号 `iBobbySun` 对上游没有写权限，不改写上游远端，而是使用已有 fork 完成交付。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：`origin/main` 无法由当前账号直接推送，GitHub 返回 HTTP 403；需要上游维护者授权或通过 fork 发起 Pull Request 才能进入上游仓库。
+- 验证结果：功能提交 `0cf667b` 创建成功；`git push fork main` 成功；`git ls-remote fork refs/heads/main` 读回 `0cf667b1e4e72fa57024cfae3c0e29f2d2740fbe`，与本地功能提交一致。
+
 ## 2026-07-31 修复 MacTR 长期内存增长与资源竞态
 
 - 完成内容：为指标采集启动阶段和每轮循环增加短生命周期 `autoreleasepool`；使用 generation 和锁保护指标循环的 stop/start 生命周期；将 DisplayEngine 的运行标志和渲染设置改为锁保护快照，并修正系统唤醒时 USB 队列无法退出帧循环的问题；USB hotplug 现保存并释放两组 VID/PID 的全部 notification iterator；指标采集器析构时关闭 SMC connection。
