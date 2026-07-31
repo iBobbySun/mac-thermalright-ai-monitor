@@ -20,8 +20,7 @@ final class USBHotplug: @unchecked Sendable {
     var onDisconnect: (() -> Void)?
 
     private var notifyPort: IONotificationPortRef?
-    private var addedIterator: io_iterator_t = 0
-    private var removedIterator: io_iterator_t = 0
+    private var iterators: [io_iterator_t] = []
     private let queue = DispatchQueue(label: "com.thermalvision.hotplug")
 
     // VID/PID pairs to watch
@@ -31,6 +30,7 @@ final class USBHotplug: @unchecked Sendable {
     ]
 
     func start() {
+        guard notifyPort == nil else { return }
         notifyPort = IONotificationPortCreate(kIOMainPortDefault)
         guard let notifyPort else { return }
 
@@ -42,29 +42,39 @@ final class USBHotplug: @unchecked Sendable {
             // Watch for device added
             if let matchCopy = matching.map({ NSDictionary(dictionary: $0 as NSDictionary) as CFDictionary }) {
                 let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-                IOServiceAddMatchingNotification(
+                var iterator: io_iterator_t = 0
+                let result = IOServiceAddMatchingNotification(
                     notifyPort,
                     kIOFirstMatchNotification,
                     matchCopy,
                     deviceAdded,
                     selfPtr,
-                    &addedIterator)
-                // Drain existing matches
-                drainIterator(addedIterator)
+                    &iterator)
+                if result == KERN_SUCCESS {
+                    iterators.append(iterator)
+                    drainIterator(iterator)
+                } else if iterator != 0 {
+                    IOObjectRelease(iterator)
+                }
             }
 
             // Watch for device removed
             if let matchCopy = matching.map({ NSDictionary(dictionary: $0 as NSDictionary) as CFDictionary }) {
                 let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-                IOServiceAddMatchingNotification(
+                var iterator: io_iterator_t = 0
+                let result = IOServiceAddMatchingNotification(
                     notifyPort,
                     kIOTerminatedNotification,
                     matchCopy,
                     deviceRemoved,
                     selfPtr,
-                    &removedIterator)
-                // Drain existing matches
-                drainIterator(removedIterator)
+                    &iterator)
+                if result == KERN_SUCCESS {
+                    iterators.append(iterator)
+                    drainIterator(iterator)
+                } else if iterator != 0 {
+                    IOObjectRelease(iterator)
+                }
             }
         }
 
@@ -72,14 +82,10 @@ final class USBHotplug: @unchecked Sendable {
     }
 
     func stop() {
-        if addedIterator != 0 {
-            IOObjectRelease(addedIterator)
-            addedIterator = 0
+        for iterator in iterators where iterator != 0 {
+            IOObjectRelease(iterator)
         }
-        if removedIterator != 0 {
-            IOObjectRelease(removedIterator)
-            removedIterator = 0
-        }
+        iterators.removeAll()
         if let notifyPort {
             IONotificationPortDestroy(notifyPort)
         }

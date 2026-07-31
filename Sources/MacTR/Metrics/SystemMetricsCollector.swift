@@ -104,6 +104,12 @@ final class SystemMetricsCollector: @unchecked Sendable {
     private var smcOpened = false
     private var smcLogOnce = true
 
+    deinit {
+        if smcOpened {
+            IOServiceClose(smcConn)
+        }
+    }
+
     // MARK: - CPU
 
     func collectCPU() -> CPUSnapshot {

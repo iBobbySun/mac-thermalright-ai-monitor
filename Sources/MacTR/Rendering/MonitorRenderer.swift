@@ -16,6 +16,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     // Background metrics collection — decoupled from frame loop for consistent refresh
     private let metricsQueue = DispatchQueue(label: "com.thermalvision.metrics")
     private var metricsRunning = false
+    private var metricsGeneration: UInt64 = 0
     private let lock = NSLock()
 
     // Cached snapshots (written by metricsQueue, read by render thread)
@@ -71,20 +72,29 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     /// Primes all metrics synchronously, then starts async collection loop.
     /// Safe to call multiple times — returns immediately if already running.
     func startMetrics() {
+        let generation: UInt64
         lock.lock()
         guard !metricsRunning else { lock.unlock(); return }
         metricsRunning = true
+        metricsGeneration &+= 1
+        generation = metricsGeneration
         lock.unlock()
         log("[Metrics] Starting collection...")
-        // First pass: prime CPU ticks (deltas will be zero)
-        let cpu0 = collector.collectCPU()
-        let mem = collector.collectMemory()
-        let temp = collector.collectTemperature()
-        let agents = agentCollector.collect()
-        let sys = collector.collectSystem()
+
+        // Prime inside a short-lived pool as startMetrics() may be called from
+        // the USB queue block that owns the frame loop for the app's lifetime.
+        let initial = autoreleasepool {
+            (
+                collector.collectCPU(),
+                collector.collectMemory(),
+                collector.collectTemperature(),
+                agentCollector.collect(),
+                collector.collectSystem()
+            )
+        }
         lock.lock()
-        _cpu = cpu0; _mem = mem
-        _temp = temp; _agents = agents; _sys = sys
+        _cpu = initial.0; _mem = initial.1
+        _temp = initial.2; _agents = initial.3; _sys = initial.4
         lock.unlock()
 
         // Second pass: get real CPU deltas
@@ -95,12 +105,17 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         lock.unlock()
 
         // Start async collection loop
-        metricsQueue.async { [weak self] in self?.metricsLoop() }
+        metricsQueue.async { [weak self] in
+            self?.metricsLoop(generation: generation)
+        }
     }
 
     func stopMetrics() {
         log("[Metrics] Stopping collection")
+        lock.lock()
         metricsRunning = false
+        metricsGeneration &+= 1
+        lock.unlock()
     }
 
     /// True when a column has a live animation (breathing while working, or the
@@ -114,32 +129,40 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             || (visibleAgents.contains(.codex) && (a.codex.isWorking || a.codex.needsAttention))
     }
 
-    private func metricsLoop() {
+    private func metricsLoop(generation: UInt64) {
         log("[Metrics] Loop started on metricsQueue")
         var slowTick = 0
-        while metricsRunning {
-            // Fast metrics every tick
-            let cpu = collector.collectCPU()
-            let mem = collector.collectMemory()
-            lock.lock()
-            _cpu = cpu; _mem = mem
-            lock.unlock()
-
-            // Slow metrics every 4th tick (~2s)
-            slowTick += 1
-            if slowTick >= 4 {
-                let temp = collector.collectTemperature()
-                let agents = agentCollector.collect()
-                let sys = collector.collectSystem()
+        while isMetricsRunning(generation: generation) {
+            // Foundation JSON/file APIs create autoreleased objects. This loop's
+            // dispatch block lives for the entire app session, so drain per tick.
+            autoreleasepool {
+                let cpu = collector.collectCPU()
+                let mem = collector.collectMemory()
                 lock.lock()
-                _temp = temp; _agents = agents; _sys = sys
+                _cpu = cpu; _mem = mem
                 lock.unlock()
-                slowTick = 0
+
+                slowTick += 1
+                if slowTick >= 4 {
+                    let temp = collector.collectTemperature()
+                    let agents = agentCollector.collect()
+                    let sys = collector.collectSystem()
+                    lock.lock()
+                    _temp = temp; _agents = agents; _sys = sys
+                    lock.unlock()
+                    slowTick = 0
+                }
             }
 
             Thread.sleep(forTimeInterval: 0.5)
         }
         log("[Metrics] Loop exited (metricsRunning=false)")
+    }
+
+    private func isMetricsRunning(generation: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return metricsRunning && metricsGeneration == generation
     }
 
     // Demo mode: drive the display with polished fake data (for screenshots / photos

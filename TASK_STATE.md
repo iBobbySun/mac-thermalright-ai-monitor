@@ -1,5 +1,37 @@
 # TASK_STATE
 
+## 2026-07-31 修复 MacTR 长期内存增长与资源竞态
+
+- 完成内容：为指标采集启动阶段和每轮循环增加短生命周期 `autoreleasepool`；使用 generation 和锁保护指标循环的 stop/start 生命周期；将 DisplayEngine 的运行标志和渲染设置改为锁保护快照，并修正系统唤醒时 USB 队列无法退出帧循环的问题；USB hotplug 现保存并释放两组 VID/PID 的全部 notification iterator；指标采集器析构时关闭 SMC connection。
+- 关键决策：保持 Agent JSONL 采集、预览窗口和 LCD 渲染功能不变，仅修复对象释放边界、并发状态所有权和 IOKit 资源生命周期；保留此前未提交的预览标题栏 UI 修改，不覆盖或回退用户现有变更。
+- 修改文件：
+  - `Sources/MacTR/Rendering/MonitorRenderer.swift`
+  - `Sources/MacTR/App/AppState.swift`
+  - `Sources/MacTR/USB/USBHotplug.swift`
+  - `Sources/MacTR/Metrics/SystemMetricsCollector.swift`
+  - `TASK_STATE.md`
+- 未解决问题：当前没有连接 Thermalright LCD，USB 插拔回调和真实设备睡眠唤醒重连未做硬件实测；包内没有 XCTest target。项目仍有既有构建 warning（未声明的 Info.plist resource、素材 `nonisolated(unsafe)` 和 libusb deployment target），与本次修复无关。
+- 验证结果：普通 `swift build` 通过；`swift build --sanitize thread` 通过，Thread Sanitizer 运行约 60 秒无数据竞争报告；修复后正常 App 运行约 3 分钟 physical footprint 在 33-42 MiB 间波动，最终约 37.7 MiB、堆总量约 10.1 MiB，未修版同场景约 6 分钟曾增长至 263.2 MiB；`leaks` 仅剩约 9.38 KiB 的系统 AppIntents/XPC 项；快照生成成功且尺寸为 `519x1404`；`git diff --check` 通过；测试进程均已停止。
+
+## 2026-07-31 MacTR 长期内存增长与系统重启诊断
+
+- 完成内容：结合 2026-07-31 的 panic/Jetsam 诊断、当前源码审查和本机动态堆采样，复现并定位 `MacTR` 的持续内存增长；在临时 Git worktree 中验证最小修复后已清理测试进程和临时 worktree。
+- 关键决策：根因判定为 `MonitorRenderer.metricsLoop()` 的长生命周期 GCD 闭包没有按轮次建立 `autoreleasepool`；`AgentUsageCollector` 每约 2 秒读取并解析 Claude/Codex JSONL，产生的 `NSData`、`CFString`、`NSDictionary` 和 `_NSJSONReader` 临时对象直到采集循环退出才释放。`leaks` 只报告约 14 KiB 的系统 AppIntents/XPC 循环，因此传统强引用泄露不是本次几十 GiB 增长的主因。此次请求为诊断，未直接修改正式源码。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：本条诊断当时发现的 `autoreleasepool`、跨线程状态和 USB iterator 问题，已由上方“修复 MacTR 长期内存增长与资源竞态”里程碑解决。
+- 验证结果：Jetsam 中 `MacTR` UUID `BC98B777-A597-33C8-BD29-ED4573B91849` 与当前 `.build/release/MacTR` 一致；panic 时 `MacTR` 常驻内存约 27.5 GiB。未修版动态测试约 6 分钟内 physical footprint 从 40.1 MiB 增至 263.2 MiB，堆中 `NSConcreteData` 约 200.5 MiB、`CFString (Storage)` 约 23.4 MiB、`_NSJSONReader` 4,748 个；仅在临时副本为 `metricsLoop()` 单轮加入 `autoreleasepool` 后，约 4 分钟 physical footprint 稳定在 35-37 MiB，堆总量约 10.4 MiB。`swift build` 通过；测试进程与临时 worktree 已清理。
+
+## 2026-07-30 移除预览窗口标题栏置顶复选框
+
+- 完成内容：移除预览窗口标题栏右上角的“置顶”复选框；`--preview` 独立预览窗口和菜单栏 App 的自动/手动预览窗口都不再添加标题栏附件控件。
+- 关键决策：保留既有 `UserDefaults` 置顶状态和菜单栏 `Always on Top` 菜单项，避免删除置顶能力本身；本次仅移除窗口标题栏 UI。
+- 修改文件：
+  - `Sources/MacTR/App/MacTRApp.swift`
+  - `TASK_STATE.md`
+- 未解决问题：项目仍有与本次 UI 调整无关的既有构建 warning（Info.plist resource 声明、素材文件 `nonisolated(unsafe)`、libusb deployment target 提示），本次未处理。
+- 验证结果：`swift build` 通过；`git diff --check` 通过；已用 `rg` 确认 `MacTRApp.swift` 中不再存在标题栏置顶按钮创建/同步逻辑。
+
 ## 2026-07-24 移除 CPU/Memory 装饰显示
 
 - 完成内容：移除 CPU 面板中的皮卡丘渲染；移除 Memory 面板中的 Bongo Cat/小猫渲染，并将底部日期与系统信息左移填补空位；移除不再需要的 CPU 高负载动画帧率触发。

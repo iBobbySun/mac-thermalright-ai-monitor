@@ -28,25 +28,6 @@ private enum PreviewAlwaysOnTop {
     static func apply(to window: NSWindow?) {
         window?.level = isEnabled ? .floating : .normal
     }
-
-    static func addTitlebarToggle(to window: NSWindow, target: AnyObject, action: Selector) -> NSButton {
-        let button = NSButton(checkboxWithTitle: "置顶", target: target, action: action)
-        button.controlSize = .small
-        button.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        button.toolTip = "始终在最前面显示预览窗口"
-        button.state = isEnabled ? .on : .off
-        button.sizeToFit()
-
-        let accessory = NSTitlebarAccessoryViewController()
-        accessory.layoutAttribute = .right
-        accessory.view = button
-        window.addTitlebarAccessoryViewController(accessory)
-        return button
-    }
-
-    static func sync(_ button: NSButton?) {
-        button?.state = isEnabled ? .on : .off
-    }
 }
 
 private func previewContentSize(for frameSize: NSSize) -> NSSize {
@@ -146,7 +127,6 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var imageView: NSImageView!
     private let renderer = MonitorRenderer()
     private var timer: Timer?
-    private var alwaysOnTopButton: NSButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("[Preview] Starting preview window (no LCD)")
@@ -163,8 +143,6 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
         window.contentAspectRatio = frameSize
         window.delegate = self
         PreviewAlwaysOnTop.apply(to: window)
-        alwaysOnTopButton = PreviewAlwaysOnTop.addTitlebarToggle(
-            to: window, target: self, action: #selector(toggleAlwaysOnTopFromWindow))
 
         imageView = NSImageView(frame: NSRect(origin: .zero, size: contentSize))
         imageView.imageScaling = .scaleProportionallyUpOrDown
@@ -190,12 +168,6 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
     private func refresh() {
         guard let image = renderer.render() else { return }
         imageView.image = NSImage(cgImage: image, size: imageSize(image))
-    }
-
-    @objc private func toggleAlwaysOnTopFromWindow(_ sender: NSButton) {
-        PreviewAlwaysOnTop.isEnabled = sender.state == .on
-        PreviewAlwaysOnTop.apply(to: window)
-        PreviewAlwaysOnTop.sync(alwaysOnTopButton)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -231,7 +203,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var versionMenuItem: NSMenuItem!
     private var reconnectItem: NSMenuItem!
     private var previewAlwaysOnTopItem: NSMenuItem!
-    private var previewAlwaysOnTopButton: NSButton?
     private var updateTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -445,7 +416,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         reconnectItem.isHidden = appState.isConnected
 
         previewAlwaysOnTopItem.state = PreviewAlwaysOnTop.isEnabled ? .on : .off
-        PreviewAlwaysOnTop.sync(previewAlwaysOnTopButton)
     }
 
     // MARK: - Preview Window (auto-fallback when LCD is disconnected)
@@ -470,8 +440,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             window.isReleasedWhenClosed = false
             window.delegate = self
             PreviewAlwaysOnTop.apply(to: window)
-            previewAlwaysOnTopButton = PreviewAlwaysOnTop.addTitlebarToggle(
-                to: window, target: self, action: #selector(togglePreviewAlwaysOnTopFromWindow))
 
             let imageView = NSImageView(frame: NSRect(origin: .zero, size: contentSize))
             imageView.imageScaling = .scaleProportionallyUpOrDown
@@ -484,7 +452,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         resizePreviewForCurrentSettings()
         PreviewAlwaysOnTop.apply(to: previewWindow)
-        PreviewAlwaysOnTop.sync(previewAlwaysOnTopButton)
         previewWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -525,15 +492,10 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         setPreviewAlwaysOnTop(!PreviewAlwaysOnTop.isEnabled)
     }
 
-    @objc private func togglePreviewAlwaysOnTopFromWindow(_ sender: NSButton) {
-        setPreviewAlwaysOnTop(sender.state == .on)
-    }
-
     private func setPreviewAlwaysOnTop(_ enabled: Bool) {
         PreviewAlwaysOnTop.isEnabled = enabled
         PreviewAlwaysOnTop.apply(to: previewWindow)
         previewAlwaysOnTopItem.state = enabled ? .on : .off
-        PreviewAlwaysOnTop.sync(previewAlwaysOnTopButton)
     }
 
     // User closed the preview window — stop rendering to it; reopen via the

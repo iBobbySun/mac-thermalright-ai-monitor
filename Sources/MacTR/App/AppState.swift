@@ -147,20 +147,22 @@ struct EngineStatus: Sendable {
 
 final class DisplayEngine: @unchecked Sendable {
 
+    private struct Settings {
+        var set: DisplaySet = .systemMonitor
+        var brightness: Int = 5
+        var interval: Double = 0.5
+        var rotateDisplay: Bool = false
+    }
+
     private let statusCallback: @Sendable (EngineStatus) -> Void
     private let usbQueue = DispatchQueue(label: "com.thermalvision.usb")
+    private let stateLock = NSLock()
     private var device: USBDevice?
     private var hotplug: USBHotplug?
     private var running = false
     private var frameCount = 0
     private var lastFrameSize = 0
-
-    // Settings (atomically accessed)
-    private var currentSet: DisplaySet = .systemMonitor
-    private var brightness: Int = 5
-    private var interval: Double = 0.5
-    private var rotateDisplay: Bool = false
-    private var agentDisplayConfig = AgentDisplayConfig.defaultValue
+    private var settings = Settings()
 
     // Renderers
     private let monitorRenderer = MonitorRenderer()
@@ -171,11 +173,13 @@ final class DisplayEngine: @unchecked Sendable {
 
     func start(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool,
                agentDisplay: AgentDisplayConfig) {
-        self.currentSet = set
-        self.brightness = brightness
-        self.interval = interval
-        self.rotateDisplay = rotate
-        self.agentDisplayConfig = agentDisplay.normalized
+        stateLock.lock()
+        settings = Settings(
+            set: set,
+            brightness: brightness,
+            interval: interval,
+            rotateDisplay: rotate)
+        stateLock.unlock()
         monitorRenderer.updateAgentDisplay(agentDisplay)
 
         usbQueue.async { [weak self] in
@@ -188,7 +192,7 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     func stop() {
-        running = false
+        setRunning(false)
         monitorRenderer.stopMetrics()
         usbQueue.async { [weak self] in
             self?.hotplug?.stop()
@@ -213,18 +217,20 @@ final class DisplayEngine: @unchecked Sendable {
     func updateSettings(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool,
                         agentDisplay: AgentDisplayConfig) {
         log("[Engine] Settings updated: set=\(set.rawValue), brightness=\(brightness), interval=\(interval), rotate=\(rotate), agents=\(agentDisplay.visibleAgents.map(\.rawValue).joined(separator: ",")), dashboardLayout=\(agentDisplay.layoutDirection.rawValue)")
-        self.currentSet = set
-        self.brightness = brightness
-        self.interval = interval
-        self.rotateDisplay = rotate
-        self.agentDisplayConfig = agentDisplay.normalized
+        stateLock.lock()
+        settings = Settings(
+            set: set,
+            brightness: brightness,
+            interval: interval,
+            rotateDisplay: rotate)
+        stateLock.unlock()
         monitorRenderer.updateAgentDisplay(agentDisplay)
     }
 
     // MARK: - Private (all on usbQueue)
 
     private func connectAndRun() {
-        guard !running else { return }
+        guard !isRunning() else { return }
 
         // Ensure metrics collection is running (may have been stopped on disconnect/sleep)
         monitorRenderer.startMetrics()
@@ -263,33 +269,34 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     private func runFrameLoop(device: USBDevice, info: DeviceInfo) {
-        running = true
+        setRunning(true)
         // Metrics already collecting in background via startMetrics()
 
         var nextDeadline = DispatchTime.now()
 
-        while running {
+        while isRunning() {
+            let settings = settingsSnapshot()
+
             // Adaptive frame rate: the device sustains ~19fps, but the dashboard's
             // data only changes every ~2s. Run fast (15fps) ONLY while a column is
             // animating (agent working → breathing, or done → blinking); otherwise
             // idle at the configured interval to save CPU/power on this always-on app.
-            let animating = (currentSet == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
-            let frameInterval = animating ? (1.0 / 15.0) : interval
+            let animating = settings.set == .systemMonitor && monitorRenderer.wantsHighFrameRate()
+            let frameInterval = animating ? (1.0 / 15.0) : settings.interval
             nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
             autoreleasepool {
-                let set = currentSet
-                let bright = brightness
-                let rotate = rotateDisplay
-
                 let jpeg: Data?
 
-                switch set {
+                switch settings.set {
                 case .systemMonitor:
                     if let image = monitorRenderer.render() {
-                        jpeg = JPEGEncoder.encode(image, brightness: bright, rotate: rotate)
+                        jpeg = JPEGEncoder.encode(
+                            image,
+                            brightness: settings.brightness,
+                            rotate: settings.rotateDisplay)
                     } else {
                         jpeg = nil
                     }
@@ -307,7 +314,7 @@ final class DisplayEngine: @unchecked Sendable {
                                    message: "Active")
                     } catch {
                         log("[ERROR] Frame send failed: \(error)")
-                        running = false
+                        setRunning(false)
                         self.device?.close()
                         self.device = nil
                         postStatus(connected: false, message: "Disconnected (send error)")
@@ -338,7 +345,7 @@ final class DisplayEngine: @unchecked Sendable {
         hp.onConnect = { [weak self] in
             guard let self else { return }
             self.usbQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                guard let self, !self.running else { return }
+                guard let self, !self.isRunning() else { return }
                 log("[Hotplug] Attempting reconnect...")
                 self.monitorRenderer.startMetrics()
                 self.connectAndRun()
@@ -348,7 +355,7 @@ final class DisplayEngine: @unchecked Sendable {
         hp.onDisconnect = { [weak self] in
             guard let self else { return }
             log("[Hotplug] Device removed")
-            self.running = false
+            self.setRunning(false)
             // Metrics keep collecting — the on-Mac preview window takes over
             // rendering while the LCD is away
             self.usbQueue.async { [weak self] in
@@ -370,27 +377,36 @@ final class DisplayEngine: @unchecked Sendable {
             center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 log("[Wake] macOS woke from sleep — reconnecting in 3s...")
+                // The frame loop occupies usbQueue. Signal it from this callback
+                // first so the queued cleanup/reconnect block can run.
+                self.setRunning(false)
                 self.usbQueue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                     guard let self else { return }
-                    self.running = false
                     self.device?.close()
                     self.device = nil
                     log("[Wake] Attempting reconnect...")
                     self.connectAndRun()
                 }
             }
-
-            center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
-                guard let self else { return }
-                if !self.running {
-                    log("[Wake] Screens woke — reconnecting in 2s...")
-                    self.usbQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                        guard let self, !self.running else { return }
-                        self.connectAndRun()
-                    }
-                }
-            }
         }
+    }
+
+    private func isRunning() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running
+    }
+
+    private func setRunning(_ value: Bool) {
+        stateLock.lock()
+        running = value
+        stateLock.unlock()
+    }
+
+    private func settingsSnapshot() -> Settings {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return settings
     }
 
     private func postStatus(
