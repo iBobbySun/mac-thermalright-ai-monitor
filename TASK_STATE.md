@@ -1,5 +1,14 @@
 # TASK_STATE
 
+## 2026-08-03 提交并推送 MacTR 关闭行为修复
+
+- 完成内容：将预览永久关闭、退出不重启、额度采集改动、构建启动入口和任务状态提交并推送到用户 fork。
+- 关键决策：保留 `origin` 上游远端不变，使用已有 `fork` 远端 `iBobbySun/mac-thermalright-ai-monitor` 的 `main` 分支交付；不 force-push，不改写上游历史。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：`origin/main` 仍比本地落后 5 个提交，这是上游远端未同步 fork 内容的正常状态；本次没有向上游直接推送。
+- 验证结果：提交 `02af29b3e41986cf5a17f2aed9789db7a1bdb964` 已创建；`git push fork main` 成功；`git ls-remote fork refs/heads/main` 回读到同一提交；工作区提交前无未暂存业务改动。
+
 ## 2026-08-03 完成 MacTR 永久关闭验证
 
 - 完成内容：完成预览自动显示的持久化关闭、菜单恢复开关、SwiftPM `.app` 构建入口，并卸载当前 `com.mactr.manual` `launchd` 常驻服务。
