@@ -1,9 +1,10 @@
 // AgentUsageCollector.swift — Claude Code / Codex CLI usage collection
 //
 // Parses local session transcripts to report today's token usage and the
-// agent's latest activity. No subprocess, no network:
+// agent's latest activity:
 //   Claude: ~/.claude/projects/<proj>/<session>.jsonl — per-message "usage"
 //   Codex:  ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — "token_count" events
+//   Quota:  latest standard "codex" rate-limit event in local session JSONL
 //
 // Files are read incrementally (per-file byte offsets) so the steady-state
 // cost per tick is a stat() per candidate file plus any appended bytes —
@@ -86,7 +87,8 @@ final class AgentUsageCollector: @unchecked Sendable {
     // one, so we track the newest-by-timestamp across recent files and cache it.
     private var codexQuotaCache: (used: Double, resets: Date?)?
     private var codexQuotaTS = ""            // newest reading's timestamp seen so far
-    private var codexQuotaLastScan: Date?
+    private var codexQuotaLastRefresh: Date?
+    private let codexQuotaRefreshInterval: TimeInterval = 5 * 60
 
     func collect() -> AgentsSnapshot {
         rolloverIfNeeded()
@@ -450,17 +452,19 @@ final class AgentUsageCollector: @unchecked Sendable {
             .replacingOccurrences(of: "\\\\", with: "\\")
     }
 
-    /// Refresh the cached quota from the NEWEST full rate-limit reading across recent
-    /// session files (by timestamp). Codex emits the populated `primary` block only
-    /// occasionally and the freshest one can be in a different file than the active
-    /// session, so a single-file tail scan is unreliable. Throttled since it changes
-    /// slowly; lines without a populated primary don't contain "used_percent" and are
-    /// rejected cheaply, so the reversed scan stops at each file's newest reading fast.
+    /// Refresh from local session JSONL only. This intentionally trades freshness for
+    /// low, predictable overhead: no subprocess, network request, or credential access.
     private func updateCodexQuota() {
-        if let last = codexQuotaLastScan, Date().timeIntervalSince(last) < 20,
-           codexQuotaCache != nil { return }
-        codexQuotaLastScan = Date()
+        if let last = codexQuotaLastRefresh,
+           Date().timeIntervalSince(last) < codexQuotaRefreshInterval {
+            return
+        }
+        codexQuotaLastRefresh = Date()
+        updateCodexQuotaFromTranscripts()
+    }
 
+    /// Find the newest standard quota reading across recent session files.
+    private func updateCodexQuotaFromTranscripts() {
         let root = home + "/.codex/sessions"
         let df = DateFormatter(); df.dateFormat = "yyyy/MM/dd"
         let cutoff = Date().addingTimeInterval(-3 * 86400)
@@ -484,6 +488,13 @@ final class AgentUsageCollector: @unchecked Sendable {
                           let primary = limits["primary"] as? [String: Any],
                           let used = (primary["used_percent"] as? NSNumber)?.doubleValue
                     else { continue }
+                    // Codex can emit independent experimental limit pools in the same
+                    // transcript. They must not override the account's standard quota.
+                    // Accept a missing ID for compatibility with older session logs.
+                    if let limitID = limits["limit_id"] as? String,
+                       limitID != "codex" {
+                        continue
+                    }
                     if ts > codexQuotaTS {
                         codexQuotaTS = ts
                         var resets: Date?

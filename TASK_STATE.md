@@ -1,5 +1,104 @@
 # TASK_STATE
 
+## 2026-08-03 完成 MacTR 永久关闭验证
+
+- 完成内容：完成预览自动显示的持久化关闭、菜单恢复开关、SwiftPM `.app` 构建入口，并卸载当前 `com.mactr.manual` `launchd` 常驻服务。
+- 关键决策：关闭预览窗口会将自动预览偏好保存为关闭；“Preview Window”仍可手动打开；当前服务属于外部 `launchctl submit` 实例，直接卸载该精确服务，不修改用户其他 LaunchAgent。
+- 修改文件：
+  - `Sources/MacTR/App/MacTRApp.swift`
+  - `script/build_and_run.sh`
+  - `.codex/environments/environment.toml`
+  - `TASK_STATE.md`
+- 未解决问题：未对真实 Thermalright LCD 连接/断开做硬件实测；如果未来有其他工具重新提交新的 `KeepAlive` 服务，仍需卸载那个新服务。工作区原有的 `Sources/MacTR/Metrics/AgentUsageCollector.swift` 改动未触碰。
+- 验证结果：`bash -n script/build_and_run.sh` 通过；`./script/build_and_run.sh --verify` 成功构建并启动 `dist/MacTR.app`；已补齐 Sparkle framework 并通过 `plutil -lint`；正常发送 AppleScript Quit 后进程消失，且 `launchctl list` 不再有 MacTR 匹配项；`git diff --check` 通过。构建仅保留既有 Info.plist、素材 `nonisolated(unsafe)` 和 libusb deployment-target warning。
+
+## 2026-08-03 实现预览永久关闭与正常退出
+
+- 完成内容：新增“Auto Preview When LCD Is Disconnected”持久化开关；用户关闭预览窗口后自动关闭该策略，应用重启或设备状态变化时不再自动打开；菜单仍可手动重新开启或单独打开预览窗口。
+- 关键决策：默认保持原行为（首次运行仍自动预览），关闭窗口后将偏好写入 `UserDefaults`；仅改变自动显示策略，不删除手动 `Preview Window` 功能。按 macOS 构建规范新增统一的本地构建/启动入口。
+- 修改文件：
+  - `Sources/MacTR/App/MacTRApp.swift`
+  - `script/build_and_run.sh`
+  - `.codex/environments/environment.toml`
+  - `TASK_STATE.md`
+- 未解决问题：当前已加载的 `com.mactr.manual` `launchd` 常驻服务尚未卸载；在完成构建验证前，退出旧实例仍可能被该外部服务重新拉起。
+- 验证结果：已完成源码和本地运行入口修改；待执行 `bash -n`、`swift build -c release`、启动检查，以及卸载 `com.mactr.manual` 后的退出验证。
+
+## 2026-08-03 诊断关闭后 MacTR 自动重新打开
+
+- 完成内容：检查当前 MacTR 进程父进程、`launchctl` 托管状态、打包启动配置，以及关闭/预览窗口代码路径，确认自动重新打开的两个来源。
+- 关键决策：将“退出整个 MacTR 后被重新拉起”和“只关闭本机预览窗口后再次出现”分开判断；本次仅诊断，不卸载或修改现有启动服务，也不覆盖工作区已有改动。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：当前实际加载的是由 `launchctl submit` 提交的 `com.mactr.manual` 服务，不是仓库中的 `packaging/com.beret21.MacTR.plist`；若要彻底停止自动拉起，需要后续明确执行该服务的卸载/禁用。LCD 未连接时的自动预览是否保留，也需要按用户意图决定。
+- 验证结果：`launchctl print gui/502/com.mactr.manual` 显示程序为 `.build/release/MacTR`、`properties = keepalive | inferred program`、`runs = 6`、`last exit code = 0`、当前 PID 的 PPID 为 1；源码中 `Quit MacTR` 使用 `NSApp.terminate(nil)`，因此正常退出后仍被外部 `launchd` 服务拉起。另确认 `StatusBarController` 在 LCD 未连接时会在启动后约 2 秒调用 `showPreview()`，设备状态变化时也会再次调用；关闭预览窗口只停止定时器，不会解除该自动预览策略。未修改 `Sources/MacTR/App/MacTRApp.swift` 或其他业务源码。
+
+## 2026-07-31 复核 Codex 与 bengalfox 额度池差异
+
+- 完成内容：只读检查本机 Codex app-server 协议、二进制字符串、本地配置/功能缓存，以及当前 session 的模型和 rate-limit 元数据，分析 `limit_id=codex` 与 `limit_id=codex_bengalfox` 的关系及持续返回后者的原因。
+- 关键决策：区分已确认事实与推断；已确认两者是服务端同时返回的独立 metered bucket，标准软件 Usage 使用 `codex`，而 `bengalfox` 没有本地开关或公开名称定义。当前持续返回后者推断为服务端对任务/账号的实验或产品路由，不能把内部代号武断映射为具体套餐、免费额度或模型。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：OpenAI 官方公开资料未说明 `codex_bengalfox` 的业务含义、分配规则和退出条件；本地无法确定它是否免费、是否影响标准额度、何时切回 `codex`。只能等待服务端后续事件或官方说明。
+- 验证结果：本机 app-server 多 bucket 快照曾同时包含 `codex` 和 `codex_bengalfox`；标准 `codex` 最后事件为 `2026-07-31T01:51:39.019Z`、已用 19%、固定 7 天窗口重置时间，`bengalfox` 随后持续返回 0%、7 天窗口且重置时间随请求滚动；切换前后 session 的模型均为 `gpt-5.6-sol`、来源均为 Codex Desktop；`~/.codex/config.toml`、Codex feature cache/Preferences 和本机 Codex 二进制中均未发现 `bengalfox` 配置字符串。
+
+## 2026-07-31 复核 JSONL 额度与 Codex 软件差异
+
+- 完成内容：只读核对最近 4 天 session JSONL 中各额度池的最后事件，确认 MacTR 显示 81% 而 Codex 软件显示 78% 的原因。
+- 关键决策：本次不调用 app-server、不修改业务代码；纯本地模式只能展示最后写入 JSONL 的标准 `codex` 额度，不能从 Token 数量可靠推算实时额度。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：标准 `codex` 额度事件停止写入后，本地显示会持续滞后；提高扫描频率无法解决源数据没有更新的问题。可后续在界面增加“最后更新时间”或过期标识，避免把旧值理解为实时值。
+- 验证结果：标准 `limit_id=codex` 最后事件为 `2026-07-31T01:51:39.019Z`、`used_percent=19`、剩余 81%；之后到 `2026-07-31T02:42:05.097Z` 只继续写入 `limit_id=codex_bengalfox`、`used_percent=0`。约 50 分钟内缺少新的标准额度事件，与 Codex 软件已变化到剩余 78% 的现象吻合。
+
+## 2026-07-31 切换 Codex 额度为纯本地 JSONL
+
+- 完成内容：彻底移除 Codex app-server、`Process`、`Pipe`、协议轮询和网络额度读取；额度只扫描本机 session JSONL 中最新的标准 `limit_id=codex` 记录，并将扫描频率降为每 5 分钟一次。
+- 关键决策：用户明确接受额度滞后，优先保证低系统开销和长期稳定；刷新节流不再依赖是否已有 cache，因此即使本地没有额度记录也不会高频重试；继续排除 `codex_bengalfox` 等独立额度池。
+- 修改文件：
+  - `Sources/MacTR/Metrics/AgentUsageCollector.swift`
+  - `TASK_STATE.md`
+- 未解决问题：JSONL 不是实时额度源，当前最后标准记录仍为已用 19%、剩余 81%，可能落后于 Codex UI；只有新的标准 `codex` rate-limit 事件写入本地日志后才会更新。
+- 验证结果：`swift build -c release` 通过；源码和 release 二进制均不再包含 `app-server`、`account/rateLimits/read`、`Process`、`Pipe` 或 Darwin 轮询逻辑；无模拟参数生成 `/tmp/mactr-codex-jsonl-only.png`，目检显示 JSONL 最后记录“剩余额度 81%”；当前 release 已重启为 PID 67242、PPID 1，没有直接子进程；运行约 80 秒后 `vmmap` physical footprint 为 35.6 MiB，初次本地扫描峰值 105.6 MiB 已释放。
+
+## 2026-07-31 Codex 实时额度资源开销审计
+
+- 完成内容：审查 app-server 实时额度查询的进程、pipe、超时和回收路径；跨 3 个刷新周期采样 MacTR 与直接子进程；两次执行 `leaks` 并检查 heap、vmmap、zombie 和残留子进程。
+- 关键决策：本次仅做审计，不修改业务代码；正常成功路径没有累积内存泄漏，但当前每 60 秒启动一次完整 Codex app-server 的瞬时开销偏高，且发现两个异常路径风险，需要后续修正节流条件和有界终止。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：本条发现的子进程重试风暴、无界退出等待和每分钟 app-server 开销，已由上方“切换 Codex 额度为纯本地 JSONL”里程碑通过移除整个接口读取路径解决。
+- 验证结果：190 秒共捕获 3 次 Codex 子进程，间隔约 62 秒，每次存活约 1-4 秒、峰值 RSS 约 80.7-82.7 MiB、CPU 峰值 6.5%-17.3%，无 zombie；MacTR 父进程 RSS 在采样期从起点下降约 4.7 MiB，未增长，平均 CPU 约 32.3%（主要来自既有 LCD 渲染/发送循环）；`vmmap` 显示当前 physical footprint 32.5 MiB、峰值 88.6 MiB、malloc heap 约 9.6 MiB；heap 中无存活 `NSTask`/`NSPipe`，`NSConcreteData` 仅 59 个约 1.8 KiB；两次 `leaks` 均为 287 个、14,320 bytes，内容是系统 AppIntents/XPC 循环，跨刷新周期没有增加。
+
+## 2026-07-31 接入 Codex 实时动态额度
+
+- 完成内容：将 Codex 额度主数据源从 session JSONL 改为 Codex app-server 正式接口 `account/rateLimits/read`；每 60 秒读取 `rateLimitsByLimitId.codex.primary` 并动态计算剩余额度，接口不可用且没有实时缓存时才回退到 JSONL；重新构建并重启当前 release 实例。
+- 关键决策：81% 不是固定值，而是旧 JSONL 中 `used_percent=19` 的当时结果，但该记录会滞后；实时接口返回多额度池快照，因此明确选择标准 `codex` bucket，不使用 `codex_bengalfox`，也不在源码中保存任何固定百分比。Codex 子进程按次启动，读取完成即退出，避免常驻额外服务。
+- 修改文件：
+  - `Sources/MacTR/Metrics/AgentUsageCollector.swift`
+  - `TASK_STATE.md`
+- 未解决问题：本条 app-server 实时读取方案已被上方“切换 Codex 额度为纯本地 JSONL”里程碑完整移除，不再是当前运行实现。
+- 验证结果：`swift build -c release` 通过；正式接口在截图显示 80% 后读取到 `usedPercent=21`、剩余 79%、`resetsAt=1785906380`，说明额度已随使用动态变化；无模拟参数生成 `/tmp/mactr-codex-live-quota.png`，目检显示“剩余额度 79%”，与紧邻接口读数一致；当前 release 已由 `launchd` 重启为 PID 61434、PPID 1，跨过完整刷新周期运行约 2 分 25 秒后 RSS 约 80.4 MiB，查询完成后无残留子进程。
+
+## 2026-07-31 修复 Codex 多额度池误覆盖
+
+- 完成内容：额度扫描在比较时间戳前过滤非标准 `rate_limits.limit_id`，只使用普通 `codex` 限额池，同时兼容旧日志中缺少 `limit_id` 的记录；重新构建 release，并替换当前运行实例。
+- 关键决策：不按所有额度池的全局最新时间直接覆盖缓存；`codex_bengalfox` 等独立池不代表界面所需的账号标准额度，因此跳过，缺少 ID 的旧格式仍按标准额度处理。
+- 修改文件：
+  - `Sources/MacTR/Metrics/AgentUsageCollector.swift`
+  - `TASK_STATE.md`
+- 未解决问题：本条解决了额度池误覆盖，但 JSONL 仍可能滞后；用户已在上方“切换 Codex 额度为纯本地 JSONL”里程碑明确接受该取舍。release 构建的既有 Info.plist、素材 `nonisolated(unsafe)` 和 libusb deployment target warning 未在本次处理。
+- 验证结果：`swift build -c release` 通过；无模拟参数生成 `/tmp/mactr-codex-quota-fix-real.png`，目检确认显示“剩余额度 81%”；带 `--cores` 的快照会使用硬编码模拟额度，已排除为验证干扰；旧 PID 52661 已正常停止，新 release 由 `launchd` 托管，PID 57297、PPID 1，并持续驻留运行。
+
+## 2026-07-31 Codex 剩余额度误显示 100% 诊断
+
+- 完成内容：核对当前运行中的 release 进程、Codex 最近会话内的脱敏 rate-limit 数值，以及 MacTR 的额度选择和渲染逻辑，定位剩余额度 100% 与实际 81% 不一致的原因。
+- 关键决策：本次仅回答原因，不修改业务代码；根因是 `updateCodexQuota()` 只按事件时间戳选择最新额度，没有区分 `rate_limits.limit_id`，导致普通 `codex` 额度被时间更新的 `codex_bengalfox` 独立额度池覆盖。
+- 修改文件：
+  - `TASK_STATE.md`
+- 未解决问题：本条诊断发现的多额度池误覆盖已由上方“修复 Codex 多额度池误覆盖”里程碑解决。
+- 验证结果：普通 `codex` 最新事件为 `2026-07-31T01:51:39.019Z`、`used_percent=19`、剩余 81%；`codex_bengalfox` 后续事件为 `2026-07-31T02:02:27.257Z`、`used_percent=0`；当前 `.build/release/MacTR` 进程 PID 52661 已运行约 3 分钟；源码按最新时间戳缓存后执行 `100 - used`，与误显示 100% 完全吻合。
+
 ## 2026-07-31 提交并推送内存修复
 
 - 完成内容：将内存增长、生命周期竞态、USB/SMC 资源释放及此前预览标题栏调整提交为 `0cf667b`；在本地新增 `fork` 远端，并将 `main` 推送到 `iBobbySun/mac-thermalright-ai-monitor`。

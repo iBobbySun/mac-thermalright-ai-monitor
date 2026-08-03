@@ -19,6 +19,7 @@ func log(_ message: String) {
 @MainActor
 private enum PreviewAlwaysOnTop {
     private static let defaultsKey = "previewWindowAlwaysOnTop"
+    private static let autoShowDefaultsKey = "autoShowPreviewWhenLCDDisconnected"
 
     static var isEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: defaultsKey) }
@@ -27,6 +28,16 @@ private enum PreviewAlwaysOnTop {
 
     static func apply(to window: NSWindow?) {
         window?.level = isEnabled ? .floating : .normal
+    }
+
+    static var autoShowWhenLCDDisconnected: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: autoShowDefaultsKey) != nil else {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: autoShowDefaultsKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: autoShowDefaultsKey) }
     }
 }
 
@@ -202,6 +213,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var statusMenuItem: NSMenuItem!
     private var versionMenuItem: NSMenuItem!
     private var reconnectItem: NSMenuItem!
+    private var autoPreviewItem: NSMenuItem!
     private var previewAlwaysOnTopItem: NSMenuItem!
     private var updateTimer: Timer?
 
@@ -375,6 +387,13 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         previewItem.target = self
         menu.addItem(previewItem)
 
+        autoPreviewItem = NSMenuItem(
+            title: "Auto Preview When LCD Is Disconnected",
+            action: #selector(toggleAutoPreview),
+            keyEquivalent: "")
+        autoPreviewItem.target = self
+        menu.addItem(autoPreviewItem)
+
         previewAlwaysOnTopItem = NSMenuItem(
             title: "Always on Top",
             action: #selector(togglePreviewAlwaysOnTopFromMenu),
@@ -415,6 +434,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         // Reconnect visibility
         reconnectItem.isHidden = appState.isConnected
 
+        autoPreviewItem.state = PreviewAlwaysOnTop.autoShowWhenLCDDisconnected ? .on : .off
         previewAlwaysOnTopItem.state = PreviewAlwaysOnTop.isEnabled ? .on : .off
     }
 
@@ -423,8 +443,10 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func updatePreviewForConnection() {
         if appState.isConnected {
             hidePreview()
-        } else {
+        } else if PreviewAlwaysOnTop.autoShowWhenLCDDisconnected {
             showPreview()
+        } else {
+            hidePreview()
         }
     }
 
@@ -488,6 +510,12 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         showPreview()
     }
 
+    @objc private func toggleAutoPreview() {
+        PreviewAlwaysOnTop.autoShowWhenLCDDisconnected.toggle()
+        updatePreviewForConnection()
+        updateMenuItems()
+    }
+
     @objc private func togglePreviewAlwaysOnTopFromMenu() {
         setPreviewAlwaysOnTop(!PreviewAlwaysOnTop.isEnabled)
     }
@@ -498,12 +526,14 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         previewAlwaysOnTopItem.state = enabled ? .on : .off
     }
 
-    // User closed the preview window — stop rendering to it; reopen via the
-    // menu (⌘P) or automatically on the next connect/disconnect transition
+    // User closed the preview window — stop rendering to it and persist the
+    // disabled auto-preview preference. Re-enable it from the menu when needed.
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == previewWindow else { return }
         previewTimer?.invalidate()
         previewTimer = nil
+        PreviewAlwaysOnTop.autoShowWhenLCDDisconnected = false
+        updateMenuItems()
     }
 
     // MARK: - Actions
