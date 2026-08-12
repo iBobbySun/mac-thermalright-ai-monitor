@@ -1,5 +1,13 @@
 # TASK_STATE
 
+## 2026-08-12 交付 Dock 应用、启动预览与 App 图标
+
+- 完成内容：将 MacTR 从仅菜单栏的 accessory 激活策略改为普通 Dock 应用；GUI 每次启动时立即显示 `MacTR Preview` 主窗口，不再受旧的断连自动预览偏好影响；新增 MacTR 专用 PNG/ICNS 图标和可重复的自包含 App 构建入口。
+- 关键决策：预览窗口现在是正常 GUI 启动窗口；用户手动关闭后当次运行保持关闭，下次启动再显示。构建脚本把 Sparkle、AppIcon 和 macOS 15 版 `libusb` 封装进 App，并执行本地 ad-hoc 签名校验。
+- 修改文件：`.gitignore`、`Package.swift`、`Sources/MacTR/App/MacTRApp.swift`、`Sources/MacTR/Resources/Info.plist`、`Sources/MacTR/Resources/AppIcon-1024.png`、`Sources/MacTR/Resources/AppIcon.icns`、`script/build_and_run.sh`。
+- 未解决问题：App 仅作本地 ad-hoc 签名，未使用 Developer ID 或执行 Apple 公证；发行给其他用户时仍需正式签名与 notarization。
+- 验证结果：`swift build -c release`、`bash -n script/build_and_run.sh`、`git diff --check` 和 `codesign --verify --deep --strict` 通过；实际启动 `/Users/sunbowei/Applications/MacTR.app` 后，系统返回 `activation_policy=0` (`regular`)、进程可见、窗口数为 1、`AXMain=true`、`AXMinimized=false`、窗口尺寸 `770x272`；在 `autoShowPreviewWhenLCDDisconnected=false` 时仍会自动显示启动窗口。
+
 ## 2026-08-03 提交并推送 MacTR 关闭行为修复
 
 - 完成内容：将预览永久关闭、退出不重启、额度采集改动、构建启动入口和任务状态提交并推送到用户 fork。

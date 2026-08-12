@@ -122,7 +122,7 @@ struct MacTREntry {
 
         // GUI mode — NSApplication with StatusBar
         let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)  // No dock icon
+        app.setActivationPolicy(.regular)
         let delegate = StatusBarController()
         app.delegate = delegate
         app.run()
@@ -197,7 +197,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let appState = AppState()
     private var menu: NSMenu!
 
-    // On-Mac preview — shown automatically while the LCD is disconnected
+    // Main on-Mac preview — shown on every GUI launch.
     private var previewWindow: NSWindow?
     private var previewImageView: NSImageView?
     private var previewTimer: Timer?
@@ -219,6 +219,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("[*] MacTR starting...")
+        NSApp.activate(ignoringOtherApps: true)
 
         // Create status bar item — this NEVER gets removed
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -237,7 +238,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             Task { @MainActor in
                 self?.updateIcon()
                 self?.updateMenuItems()
-                self?.updatePreviewForConnection()
+                self?.showPreviewForDisconnectedLCDIfNeeded()
             }
         }
 
@@ -253,12 +254,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         // Start engine
         appState.start()
-
-        // No LCD after the initial connect attempt → fall back to on-Mac preview.
-        // Delayed so a present device can connect first without a window flash.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.updatePreviewForConnection()
-        }
+        showPreview()
 
         // Timer to refresh menu + icon
         updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -438,15 +434,11 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         previewAlwaysOnTopItem.state = PreviewAlwaysOnTop.isEnabled ? .on : .off
     }
 
-    // MARK: - Preview Window (auto-fallback when LCD is disconnected)
+    // MARK: - Preview Window
 
-    private func updatePreviewForConnection() {
-        if appState.isConnected {
-            hidePreview()
-        } else if PreviewAlwaysOnTop.autoShowWhenLCDDisconnected {
+    private func showPreviewForDisconnectedLCDIfNeeded() {
+        if !appState.isConnected && PreviewAlwaysOnTop.autoShowWhenLCDDisconnected {
             showPreview()
-        } else {
-            hidePreview()
         }
     }
 
@@ -457,7 +449,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
                 contentRect: NSRect(origin: .zero, size: contentSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered, defer: false)
-            window.title = "MacTR — LCD 未连接，本机预览中"
+            window.title = "MacTR Preview"
             window.contentAspectRatio = appState.frameSize
             window.isReleasedWhenClosed = false
             window.delegate = self
@@ -486,12 +478,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
-    private func hidePreview() {
-        previewTimer?.invalidate()
-        previewTimer = nil
-        previewWindow?.orderOut(nil)
-    }
-
     private func refreshPreview() {
         guard let image = appState.currentFrame() else { return }
         previewImageView?.image = NSImage(cgImage: image, size: imageSize(image))
@@ -512,7 +498,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func toggleAutoPreview() {
         PreviewAlwaysOnTop.autoShowWhenLCDDisconnected.toggle()
-        updatePreviewForConnection()
+        showPreviewForDisconnectedLCDIfNeeded()
         updateMenuItems()
     }
 
@@ -526,8 +512,8 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         previewAlwaysOnTopItem.state = enabled ? .on : .off
     }
 
-    // User closed the preview window — stop rendering to it and persist the
-    // disabled auto-preview preference. Re-enable it from the menu when needed.
+    // Closing the preview keeps it closed for the current run. It will still
+    // appear again on the next normal GUI launch.
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == previewWindow else { return }
         previewTimer?.invalidate()
