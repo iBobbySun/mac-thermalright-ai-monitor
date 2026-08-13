@@ -29,6 +29,28 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     // Reusable CGContext — avoids allocating 3.6MB every 0.5s (prevents CG raster data leak)
     private var reusableCtx: CGContext?
 
+    // Agent activity text is usually unchanged across many animation frames. Cache the
+    // expensive AppKit width measurements, but cap both caches so session churn cannot
+    // turn this always-on renderer into another source of long-term memory growth.
+    private struct TextLayoutKey: Hashable {
+        let text: String
+        let fontID: ObjectIdentifier
+        let maxWidth: CGFloat
+    }
+
+    private struct WrapLayoutKey: Hashable {
+        let text: String
+        let fontID: ObjectIdentifier
+        let maxWidth: CGFloat
+        let maxLines: Int
+    }
+
+    private let textLayoutCacheLimit = 128
+    private var truncationCache: [TextLayoutKey: String] = [:]
+    private var truncationCacheOrder: [TextLayoutKey] = []
+    private var wrappingCache: [WrapLayoutKey: [String]] = [:]
+    private var wrappingCacheOrder: [WrapLayoutKey] = []
+
     // Test mode (--test-flash): force both columns into the flashing state until
     // this deadline, to preview the alert visuals without waiting for a real event
     private var testFlashUntil: Date?
@@ -953,21 +975,54 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     /// Truncate a single line with "…" to fit maxW.
     private func truncate(_ s: String, font: NSFont, maxW: CGFloat) -> String {
+        let key = TextLayoutKey(text: s, fontID: ObjectIdentifier(font), maxWidth: maxW)
+        if let cached = truncationCache[key] { return cached }
+
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        if (s as NSString).size(withAttributes: attrs).width <= maxW { return s }
-        var t = s
-        while !t.isEmpty {
-            t.removeLast()
-            if ((t + "…") as NSString).size(withAttributes: attrs).width <= maxW {
-                return t + "…"
-            }
+        let result: String
+        if (s as NSString).size(withAttributes: attrs).width <= maxW {
+            result = s
+        } else {
+            var t = s
+            result = {
+                while !t.isEmpty {
+                    t.removeLast()
+                    if ((t + "…") as NSString).size(withAttributes: attrs).width <= maxW {
+                        return t + "…"
+                    }
+                }
+                return "…"
+            }()
         }
-        return "…"
+
+        if truncationCache.count >= textLayoutCacheLimit,
+           let oldest = truncationCacheOrder.first {
+            truncationCache.removeValue(forKey: oldest)
+            truncationCacheOrder.removeFirst()
+        }
+        truncationCache[key] = result
+        truncationCacheOrder.append(key)
+        return result
+    }
+
+    private func cacheWrappedLines(_ lines: [String], for key: WrapLayoutKey) {
+        if wrappingCache.count >= textLayoutCacheLimit,
+           let oldest = wrappingCacheOrder.first {
+            wrappingCache.removeValue(forKey: oldest)
+            wrappingCacheOrder.removeFirst()
+        }
+        wrappingCache[key] = lines
+        wrappingCacheOrder.append(key)
     }
 
     /// Greedy character wrap (activity text may be CJK — no word boundaries).
     private func wrap(_ s: String, font: NSFont, maxW: CGFloat, maxLines: Int) -> [String] {
         guard maxLines >= 1 else { return [] }
+
+        let key = WrapLayoutKey(
+            text: s, fontID: ObjectIdentifier(font), maxWidth: maxW, maxLines: maxLines)
+        if let cached = wrappingCache[key] { return cached }
+
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
         var lines: [String] = []
         var current = ""
@@ -978,6 +1033,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                 if lines.count == maxLines - 1 {
                     let rest = String(s[s.index(s.startIndex, offsetBy: lines.joined().count)...])
                     lines.append(truncate(rest, font: font, maxW: maxW))
+                    cacheWrappedLines(lines, for: key)
                     return lines
                 }
                 lines.append(current)
@@ -987,6 +1043,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             }
         }
         if !current.isEmpty { lines.append(current) }
+        cacheWrappedLines(lines, for: key)
         return lines
     }
 

@@ -113,6 +113,12 @@ final class AppState {
         engine?.currentFrame()
     }
 
+    /// Whether the visible agent state currently has a breathing/blinking animation.
+    /// The preview uses this to stay smooth only while pixels are actually moving.
+    func previewWantsHighFrameRate() -> Bool {
+        engine?.wantsHighFrameRate() ?? false
+    }
+
     var frameSize: NSSize {
         let layout = DashboardLayout(agentDisplay: agentDisplayConfig)
         return NSSize(width: layout.width, height: layout.height)
@@ -212,6 +218,10 @@ final class DisplayEngine: @unchecked Sendable {
     /// is disconnected). Thread-safe: render() serializes internally.
     func currentFrame() -> CGImage? {
         monitorRenderer.render()
+    }
+
+    func wantsHighFrameRate() -> Bool {
+        monitorRenderer.wantsHighFrameRate()
     }
 
     func updateSettings(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool,

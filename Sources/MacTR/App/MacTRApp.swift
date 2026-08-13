@@ -201,6 +201,12 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var previewWindow: NSWindow?
     private var previewImageView: NSImageView?
     private var previewTimer: Timer?
+    private var previewUpdatesEnabled = false
+
+    private enum PreviewRefresh {
+        static let animatedInterval: TimeInterval = 0.1  // 10fps while breathing/blinking
+        static let idleInterval: TimeInterval = 0.5      // 2fps for metrics/clock updates
+    }
 
     // Sparkle auto-updater — only start when running from a real .app bundle;
     // a bare `swift build` binary has no Info.plist for Sparkle to work with
@@ -267,6 +273,9 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationWillTerminate(_ notification: Notification) {
         updateTimer?.invalidate()
+        previewUpdatesEnabled = false
+        previewTimer?.invalidate()
+        previewTimer = nil
         appState.stop()
     }
 
@@ -470,15 +479,41 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         NSApp.activate(ignoringOtherApps: true)
 
         if previewTimer == nil {
-            // 10fps for smooth breathing/blink (metrics are cached, recomputed ~2s)
-            previewTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.refreshPreview() }
-            }
+            previewUpdatesEnabled = true
             refreshPreview()
+            scheduleNextPreviewRefresh()
         }
     }
 
+    private func scheduleNextPreviewRefresh() {
+        guard previewUpdatesEnabled else { return }
+
+        let windowCanAnimate = previewWindow?.isVisible == true
+            && previewWindow?.isMiniaturized == false
+            && previewWindow?.occlusionState.contains(.visible) == true
+        let interval = windowCanAnimate && appState.previewWantsHighFrameRate()
+            ? PreviewRefresh.animatedInterval
+            : PreviewRefresh.idleInterval
+
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.previewTimer = nil
+                self.refreshPreview()
+                self.scheduleNextPreviewRefresh()
+            }
+        }
+        timer.tolerance = interval * 0.1
+        RunLoop.main.add(timer, forMode: .common)
+        previewTimer = timer
+    }
+
     private func refreshPreview() {
+        guard let previewWindow,
+              previewWindow.isVisible,
+              !previewWindow.isMiniaturized,
+              previewWindow.occlusionState.contains(.visible)
+        else { return }
         guard let image = appState.currentFrame() else { return }
         previewImageView?.image = NSImage(cgImage: image, size: imageSize(image))
     }
@@ -516,6 +551,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     // appear again on the next normal GUI launch.
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == previewWindow else { return }
+        previewUpdatesEnabled = false
         previewTimer?.invalidate()
         previewTimer = nil
         PreviewAlwaysOnTop.autoShowWhenLCDDisconnected = false
