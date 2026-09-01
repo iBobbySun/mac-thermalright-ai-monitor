@@ -7,6 +7,7 @@ BUNDLE_ID="com.beret21.MacTR"
 MIN_SYSTEM_VERSION="15.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MACTR_SCRATCH_DIR="${MACTR_BUILD_DIR:-$HOME/build_dir/mac-thermalright-ai-monitor}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -20,8 +21,9 @@ APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SOURCE_INFO_PLIST")"
 APP_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SOURCE_INFO_PLIST")"
 
-swift build -c release
-BUILD_BIN_DIR="$(swift build -c release --show-bin-path)"
+mkdir -p "$MACTR_SCRATCH_DIR"
+swift build --scratch-path "$MACTR_SCRATCH_DIR" -c release
+BUILD_BIN_DIR="$(swift build --scratch-path "$MACTR_SCRATCH_DIR" -c release --show-bin-path)"
 BUILD_BINARY="$BUILD_BIN_DIR/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"
@@ -32,7 +34,7 @@ cp -R "$BUILD_BIN_DIR/Sparkle.framework" "$APP_FRAMEWORKS/"
 cp "$APP_ICON" "$APP_RESOURCES/AppIcon.icns"
 install_name_tool -add_rpath "@loader_path/../Frameworks" "$APP_BINARY"
 
-VENDORED_LIBUSB="$ROOT_DIR/.build/vendor/libusb-macos15/lib/libusb-1.0.0.dylib"
+VENDORED_LIBUSB="$MACTR_SCRATCH_DIR/vendor/libusb-macos15/lib/libusb-1.0.0.dylib"
 LINKED_LIBUSB="$(otool -L "$APP_BINARY" | awk '/libusb-1\.0\.0\.dylib/{print $1; exit}')"
 if [[ -f "$VENDORED_LIBUSB" ]]; then
   LIBUSB_DYLIB="$VENDORED_LIBUSB"

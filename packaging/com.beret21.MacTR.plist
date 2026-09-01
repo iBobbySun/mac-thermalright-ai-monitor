@@ -8,7 +8,7 @@
     <!-- EDIT this to the absolute path of your built binary -->
     <key>ProgramArguments</key>
     <array>
-        <string>/REPLACE/WITH/PATH/TO/MacTR/.build/release/MacTR</string>
+        <string>/Users/REPLACE_WITH_USERNAME/build_dir/mac-thermalright-ai-monitor/release/MacTR</string>
     </array>
 
     <!-- Start at login -->

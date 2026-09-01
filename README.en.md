@@ -76,14 +76,15 @@ brew install libusb pkg-config
 
 git clone https://github.com/m1ng-li/mac-thermalright-ai-monitor.git
 cd mac-thermalright-ai-monitor
-swift build -c release
+export MACTR_BUILD_DIR="$HOME/build_dir/mac-thermalright-ai-monitor"
+swift build --scratch-path "$MACTR_BUILD_DIR" -c release
 
-.build/release/MacTR          # menu-bar app; drives the LCD, or previews in a window
+"$MACTR_BUILD_DIR/release/MacTR"          # menu-bar app; drives the LCD, or previews in a window
 ```
 
 > If your Command Line Tools are broken and `swift build` fails on the package manifest,
 > install the Homebrew Swift toolchain (`brew install swift`) and use
-> `/opt/homebrew/opt/swift/bin/swift build -c release`.
+> `/opt/homebrew/opt/swift/bin/swift build --scratch-path "$MACTR_BUILD_DIR" -c release`.
 
 ### Auto-start on login
 
@@ -95,12 +96,12 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 ## Modes
 
 ```bash
-.build/release/MacTR                 # menu-bar app (LCD, or preview window if no LCD)
-.build/release/MacTR --preview       # force the on-Mac preview window
-.build/release/MacTR --demo          # drive the LCD with polished fake data (for photos)
-.build/release/MacTR --snapshot x.png --cores 10   # render one demo frame to a PNG
-.build/release/MacTR --gif x.gif --frames 48 --fps 12 --scale 2   # animated demo GIF
-.build/release/MacTR --benchmark 120 # measure achievable LCD frame rate
+"$MACTR_BUILD_DIR/release/MacTR"                 # menu-bar app (LCD, or preview window if no LCD)
+"$MACTR_BUILD_DIR/release/MacTR" --preview       # force the on-Mac preview window
+"$MACTR_BUILD_DIR/release/MacTR" --demo          # drive the LCD with polished fake data (for photos)
+"$MACTR_BUILD_DIR/release/MacTR" --snapshot x.png --cores 10   # render one demo frame to a PNG
+"$MACTR_BUILD_DIR/release/MacTR" --gif x.gif --frames 48 --fps 12 --scale 2   # animated demo GIF
+"$MACTR_BUILD_DIR/release/MacTR" --benchmark 120 # measure achievable LCD frame rate
 ```
 
 Only one process can hold the USB device at a time — stop the running instance before

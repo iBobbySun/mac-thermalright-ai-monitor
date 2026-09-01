@@ -64,14 +64,15 @@ brew install libusb pkg-config
 
 git clone https://github.com/m1ng-li/mac-thermalright-ai-monitor.git
 cd mac-thermalright-ai-monitor
-swift build -c release
+export MACTR_BUILD_DIR="$HOME/build_dir/mac-thermalright-ai-monitor"
+swift build --scratch-path "$MACTR_BUILD_DIR" -c release
 
-.build/release/MacTR          # 菜单栏应用;驱动 LCD,或没接 LCD 时弹预览窗口
+"$MACTR_BUILD_DIR/release/MacTR"          # 菜单栏应用;驱动 LCD,或没接 LCD 时弹预览窗口
 ```
 
 > 如果系统的 Command Line Tools 损坏、`swift build` 在解析包清单时报错,
 > 装 Homebrew 的 Swift 工具链(`brew install swift`),改用
-> `/opt/homebrew/opt/swift/bin/swift build -c release`。
+> `/opt/homebrew/opt/swift/bin/swift build --scratch-path "$MACTR_BUILD_DIR" -c release`。
 
 ### 开机(登录)自启
 
@@ -83,12 +84,12 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 ## 运行模式
 
 ```bash
-.build/release/MacTR                 # 菜单栏应用(有 LCD 走 LCD,没有则预览窗口)
-.build/release/MacTR --preview       # 强制打开本机预览窗口
-.build/release/MacTR --demo          # 用精美假数据驱动 LCD(方便拍照 / 展示)
-.build/release/MacTR --snapshot x.png --cores 10        # 渲染一帧假数据到 PNG
-.build/release/MacTR --gif x.gif --frames 48 --fps 12 --scale 2   # 生成演示 GIF
-.build/release/MacTR --benchmark 120 # 测量 LCD 可达帧率
+"$MACTR_BUILD_DIR/release/MacTR"                 # 菜单栏应用(有 LCD 走 LCD,没有则预览窗口)
+"$MACTR_BUILD_DIR/release/MacTR" --preview       # 强制打开本机预览窗口
+"$MACTR_BUILD_DIR/release/MacTR" --demo          # 用精美假数据驱动 LCD(方便拍照 / 展示)
+"$MACTR_BUILD_DIR/release/MacTR" --snapshot x.png --cores 10        # 渲染一帧假数据到 PNG
+"$MACTR_BUILD_DIR/release/MacTR" --gif x.gif --frames 48 --fps 12 --scale 2   # 生成演示 GIF
+"$MACTR_BUILD_DIR/release/MacTR" --benchmark 120 # 测量 LCD 可达帧率
 ```
 
 同一时刻只能有一个进程占用 USB 设备 —— 用 `--demo` / `--benchmark` 前先停掉正在运行的实例。
