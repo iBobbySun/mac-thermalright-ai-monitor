@@ -108,9 +108,14 @@ final class AppState {
         NotificationCenter.default.post(name: .displaySettingsChanged, object: nil)
     }
 
-    /// Latest rendered frame for the on-Mac preview window
-    func currentFrame() -> CGImage? {
-        engine?.currentFrame()
+    /// Render or reuse the latest frame away from the main actor. The completion is
+    /// invoked on the engine's preview queue; UI callers should hop back to MainActor.
+    func requestPreviewFrame(completion: @escaping @Sendable (CGImage?) -> Void) {
+        guard let engine else {
+            completion(nil)
+            return
+        }
+        engine.requestPreviewFrame(completion: completion)
     }
 
     /// Whether the visible agent state currently has a breathing/blinking animation.
@@ -162,6 +167,7 @@ final class DisplayEngine: @unchecked Sendable {
 
     private let statusCallback: @Sendable (EngineStatus) -> Void
     private let usbQueue = DispatchQueue(label: "com.thermalvision.usb")
+    private let previewQueue = DispatchQueue(label: "com.thermalvision.preview-render")
     private let stateLock = NSLock()
     private var device: USBDevice?
     private var hotplug: USBHotplug?
@@ -214,10 +220,19 @@ final class DisplayEngine: @unchecked Sendable {
         }
     }
 
-    /// Latest rendered frame for the on-Mac preview window (used while the LCD
-    /// is disconnected). Thread-safe: render() serializes internally.
-    func currentFrame() -> CGImage? {
-        monitorRenderer.render()
+    /// Reuse the LCD loop's latest frame when it is no older than that loop's current
+    /// interval. If the LCD is disconnected, the preview queue renders the replacement.
+    func requestPreviewFrame(completion: @escaping @Sendable (CGImage?) -> Void) {
+        let settings = settingsSnapshot()
+        let animating = settings.set == .systemMonitor && monitorRenderer.wantsHighFrameRate()
+        let maxAge = animating ? (1.0 / 15.0) : settings.interval
+        let lcdLoopIsRunning = isRunning()
+        previewQueue.async { [monitorRenderer] in
+            let frame = lcdLoopIsRunning
+                ? monitorRenderer.currentFrame(maxAge: maxAge)
+                : monitorRenderer.render()
+            completion(frame)
+        }
     }
 
     func wantsHighFrameRate() -> Bool {

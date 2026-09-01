@@ -102,7 +102,12 @@ final class SystemMetricsCollector: @unchecked Sendable {
     // SMC connection for temperature
     private var smcConn: io_connect_t = 0
     private var smcOpened = false
+    private var smcOpenAttempted = false
     private var smcLogOnce = true
+    private var smcGPUKey: String?
+    private var smcGPUFullScanFailures = 0
+    private var smcGPUProbeDisabled = false
+    private let smcGPUFailureLimit = 3
 
     deinit {
         if smcOpened {
@@ -510,7 +515,7 @@ final class SystemMetricsCollector: @unchecked Sendable {
 
         // Fallback: SMC keys (for Intel or if HID fails)
         if cpuTemp == nil || gpuTemp == nil {
-            if !smcOpened { openSMC() }
+            if !smcOpened && !smcOpenAttempted { openSMC() }
         }
 
         if smcOpened && (cpuTemp == nil || gpuTemp == nil) {
@@ -562,16 +567,36 @@ final class SystemMetricsCollector: @unchecked Sendable {
                 "Tg0p", "Tg0d",
             ]
             if gpuTemp == nil {
-                var gpuTemps: [(String, Double)] = []
-                for key in gpuKeys {
-                    if let t = readSMCTemp(key), t > 10 && t < 120 {
-                        gpuTemps.append((key, t))
+                // A remembered key reduces a successful fallback from 42 SMC calls to
+                // two. Machines with no SMC GPU temperature stop paying for the full
+                // 21-key probe after a small bounded number of misses.
+                if let key = smcGPUKey {
+                    if let value = readSMCTemp(key), value > 10 && value < 120 {
+                        gpuTemp = value
+                    } else {
+                        smcGPUKey = nil
                     }
                 }
-                if !gpuTemps.isEmpty {
-                    gpuTemp = gpuTemps.map(\.1).reduce(0, +) / Double(gpuTemps.count)
-                    if smcLogOnce {
-                        log("[SMC] GPU temps: \(gpuTemps.map { "\($0.0)=\(String(format: "%.1f", $0.1))°C" }.joined(separator: ", "))")
+
+                if gpuTemp == nil && !smcGPUProbeDisabled {
+                    for key in gpuKeys {
+                        if let value = readSMCTemp(key), value > 10 && value < 120 {
+                            smcGPUKey = key
+                            gpuTemp = value
+                            smcGPUFullScanFailures = 0
+                            if smcLogOnce {
+                                log("[SMC] GPU temp: \(key)=\(String(format: "%.1f", value))°C")
+                            }
+                            break
+                        }
+                    }
+
+                    if gpuTemp == nil {
+                        smcGPUFullScanFailures += 1
+                        if smcGPUFullScanFailures >= smcGPUFailureLimit {
+                            smcGPUProbeDisabled = true
+                            log("[SMC] GPU temperature keys unavailable; suppressing repeated full scans")
+                        }
                     }
                 }
             }
@@ -584,6 +609,9 @@ final class SystemMetricsCollector: @unchecked Sendable {
     // MARK: - SMC Helpers
 
     private func openSMC() {
+        // AppleSMC availability is stable for the lifetime of this collector. Cache a
+        // failed open so machines without a usable service do not retry every tick.
+        smcOpenAttempted = true
         let matching = IOServiceMatching("AppleSMC")
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS

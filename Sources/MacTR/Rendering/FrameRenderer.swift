@@ -19,6 +19,17 @@ protocol FrameRenderer {
 
 enum JPEGEncoder {
 
+    private struct QualityProfile: Hashable {
+        let width: Int
+        let height: Int
+        let brightness: Int
+        let rotate: Bool
+        let maxBytes: Int
+    }
+
+    private static let encodeLock = NSLock()
+    nonisolated(unsafe) private static var successfulQuality: [QualityProfile: Double] = [:]
+
     // Reusable context for 180° rotation — prevents CG raster data leak
     nonisolated(unsafe) private static var rotateCtx: CGContext?
 
@@ -27,8 +38,14 @@ enum JPEGEncoder {
     static func encode(
         _ image: CGImage, brightness: Int = 1, rotate: Bool = true, maxBytes: Int = 650_000
     ) -> Data? {
+        encodeLock.lock()
+        defer { encodeLock.unlock() }
+
         let w = image.width
         let h = image.height
+        let profile = QualityProfile(
+            width: w, height: h, brightness: brightness,
+            rotate: rotate, maxBytes: maxBytes)
 
         var finalImage: CGImage
 
@@ -64,17 +81,27 @@ enum JPEGEncoder {
             }
         }
 
-        // Encode to JPEG with quality reduction loop
-        var quality = 0.9
-        while quality > 0.3 {
+        // Start from the quality that fit the previous frame for this output profile.
+        // Dashboard frames change incrementally, so this normally turns a worst-case
+        // twelve-pass search into one encode (or one small downward adjustment).
+        var quality = successfulQuality[profile] ?? 0.9
+        while quality >= 0.3 {
             if let data = jpegData(from: finalImage, quality: quality) {
                 if data.count <= maxBytes || quality <= 0.3 {
+                    // Recover one step when the encoded frame has ample headroom.
+                    // This avoids permanently ratcheting image quality downward after
+                    // one unusually complex frame, while keeping the next probe small.
+                    let nextQuality = data.count < maxBytes * 4 / 5
+                        ? min(0.9, quality + 0.05)
+                        : quality
+                    successfulQuality[profile] = nextQuality
                     return data
                 }
             }
-            quality -= 0.05
+            if quality <= 0.3 { break }
+            quality = max(0.3, quality - 0.05)
         }
-        return jpegData(from: finalImage, quality: 0.3)
+        return nil
     }
 
     private static func jpegData(from image: CGImage, quality: Double) -> Data? {

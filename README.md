@@ -96,7 +96,7 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 
 ## Agent 数据怎么读取
 
-MacTR 从不访问任何网络或 API,只读取这些 CLI 本来就写到本地磁盘的会话记录:
+MacTR 从不访问任何网络或 API；本 fork 已移除 Sparkle 自动更新组件，只读取这些 CLI 本来就写到本地磁盘的会话记录:
 
 | Agent | 来源 | 解析内容 |
 |---|---|---|

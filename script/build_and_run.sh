@@ -30,7 +30,6 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_FRAMEWORKS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
-cp -R "$BUILD_BIN_DIR/Sparkle.framework" "$APP_FRAMEWORKS/"
 cp "$APP_ICON" "$APP_RESOURCES/AppIcon.icns"
 install_name_tool -add_rpath "@loader_path/../Frameworks" "$APP_BINARY"
 

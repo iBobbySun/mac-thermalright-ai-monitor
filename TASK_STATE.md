@@ -1,5 +1,43 @@
 # TASK_STATE
 
+## 2026-09-01 Codex 预留 5 小时并同时显示双额度
+
+- 完成内容：Codex 与 Claude 一样固定输出“5 小时”和“7 天”两项额度；当前 Pro 事件不含 5 小时窗口时显示“5 小时剩余 --”，保留 7 天实时百分比和重置时间。
+- 兼容决策：同时解析标准 `limit_id=codex` 事件的 `primary`/`secondary`，按 `window_minutes` 归类 300 分钟和 10080 分钟窗口，不假设两个字段的固定顺序；切换到会写入 5 小时窗口的套餐后将自动填入真实值。
+- 修改文件：`Sources/MacTR/Metrics/AgentUsageCollector.swift`、`Sources/MacTR/Rendering/MonitorRenderer.swift`、`TASK_STATE.md`。
+- 验证结果：本机当前 `prolite` 标准事件为 `primary.window_minutes=10080`、`secondary=null`；release 构建、严格签名、横向/纵向真实快照均通过，截图显示 Codex“5 小时剩余 --”和“7 天剩余 60%”；当前账号尚无 Plus 双窗口事件，因此未宣称完成真实 Plus 套餐回归。
+- 发布结果：新版已发布至 `/Applications/MacTR.app` 并启动，构建与安装二进制 SHA-256 均为 `fbf6c6674672ae14c1e33edfa7398787147890035b85abecc5c518c09b912650`，System Events 回读窗口为 `MacTR Preview`；替换前版本保留为 `/Applications/MacTR-backup-20260901-161400.app`。
+
+## 2026-09-01 Claude 同时显示 5 小时与 7 天额度
+
+- 完成内容：将 Agent 额度模型从单一窗口扩展为有序额度列表；Claude 固定同时提供“5 小时”和“7 天”两项，Codex 保持现有单项标准额度。横向大卡片和纵向紧凑卡片均显示每项的剩余百分比、重置信息与独立进度条。
+- 布局决策：纵向紧凑 Claude 卡片用原活动文本空间容纳第二条额度，保留项目名、计划步骤徽标和今日 Token，避免在固定卡片高度内重叠。
+- 修改文件：`Sources/MacTR/Metrics/AgentUsageCollector.swift`、`Sources/MacTR/Rendering/MonitorRenderer.swift`、`TASK_STATE.md`。
+- 验证结果：`MACTR_BUILD_DIR=/Users/sunbowei/build_dir/mac-thermalright-ai-monitor ./script/build_and_run.sh build` 完成 release 构建并通过严格签名校验；真实本地 Claude 数据的横向/纵向快照均同时显示“5 小时剩余 94%”与“7 天剩余 67%”；成品已发布至 `/Applications/MacTR.app` 并启动，进程可执行文件与构建成品 SHA-256 均为 `d7d3d436845bc6074ce81ac0adb74f4e40bf59e8fa7e85afdc3ae47563b8fa81`，System Events 回读窗口为 `MacTR Preview`。
+- 回滚保护：替换前的安装包保留为 `/Applications/MacTR-backup-20260901-161200.app`。
+
+## 2026-09-01 构建、发布并启动回修版
+
+- 完成内容：通过项目统一入口重新构建 release App，将签名后的成品发布到 `/Applications/MacTR.app`，停止仓库 `dist` 旧实例并从正式安装路径启动。
+- 发布回滚：被替换的旧安装包保留为 `/Applications/MacTR-backup-20260901-135102.app`，未做不可恢复删除。
+- 验证结果：构建、plist lint、staging 与发布后两次 `codesign --verify --deep --strict` 均通过；源包、staging 和正式安装包的 MacTR 二进制 SHA-256 均为 `3dfc8864f03ea42e198c285def6cd48b0f2e4b75349523c6af52c5ce8db72251`；正式实例 PID 73616 持续运行自 `/Applications/MacTR.app/Contents/MacOS/MacTR`，System Events 回读 `visible=true`、窗口数 1、窗口名 `MacTR Preview`。
+
+## 2026-09-01 回修 JPEG 质量、Codex 配额与断连预览
+
+- 完成内容：JPEG 成功编码且体积低于上限 80% 时，将同输出配置的记忆质量上调 0.05，最高恢复到 0.9；恢复 Codex 标准额度时间戳的进程生命周期高水位，仅接受严格更新的读数，避免 3 天文件缓存裁剪后回退；LCD 帧循环未运行时，预览直接渲染新帧，不再以 0.5 秒同节拍缓存跳帧；AppleSMC 首次打开失败后进行负缓存，避免无可用服务的机器每 tick 重试。
+- 关键决策：LCD 已连接时仍复用其新鲜帧以保留 CPU 优化，只有断连预览绕过缓存；历史会话目录缓存继续使用 `contentsOfDirectory(at:includingPropertiesForKeys:)` 批量元数据读取，并明确记录“若 Codex 未来 resume 旧会话文件，缓存必须失效或移除”的前提。
+- 修改文件：`Sources/MacTR/Rendering/FrameRenderer.swift`、`Sources/MacTR/Metrics/AgentUsageCollector.swift`、`Sources/MacTR/App/AppState.swift`、`Sources/MacTR/Metrics/SystemMetricsCollector.swift`、`TASK_STATE.md`。
+- 未解决问题：当前仍未连接 Thermalright LCD，连接态预览/LCD 共用帧和真实 USB 发送未做硬件回归。
+- 验证结果：`MACTR_BUILD_DIR=/Users/sunbowei/build_dir/mac-thermalright-ai-monitor ./script/build_and_run.sh build` 完成 release 构建并通过 app 严格签名校验；JPEG 定向 smoke 中复杂帧压缩到 75,733 字节后，10 个富余帧从 23,360、28,436、32,186 逐步增长到 70,656 字节，证明质量记忆会回升；`bash -n script/build_and_run.sh` 与 `git diff --check` 通过。构建仅保留既有资源 `nonisolated(unsafe)` 和 Homebrew libusb macOS 26 link warning。
+
+## 2026-09-01 完成 14 项 CPU、I/O、更新与 USB 优化
+
+- 完成内容：将完全静态的渐变背景和三块面板外壳预渲染为布局级 CGImage；缓存最近渲染帧并在一个 LCD 帧间隔内供预览复用；把 GUI/独立预览绘制移到串行后台队列；复用三个固定格式的 `DateFormatter`；缓存少量代表性 HID 温度 service；为 SMC GPU key 增加命中缓存和连续 3 次全量失败后的负缓存；将 Agent 会话枚举改为 URL resource 批量元数据并缓存两天前目录；将 Claude/Codex 配额尾扫缩到 256KB 并按 size+mtime 跳过未变文件；把高频 JSONL 预筛改为字节匹配/字面量匹配；合并同一 Codex 会话的 activity/plan 尾读；移除 Sparkle 依赖、上游 feed、公钥和菜单入口；移除菜单栏 1 秒无条件刷新；修正 USB 写偏移并复用单一发送缓冲；JPEG 从同配置上一帧成功质量开始编码。
+- 关键决策：保留既有 10 FPS 动画/2 FPS 空闲调度和跨午夜会话正确性，因此今天、昨天目录仍实时枚举，只有两天前目录视为不可变；HID 优先 `PMU tdie`/GPU 代表传感器并保留两个 fallback；无自有可信 appcast 时直接移除 Sparkle，确保 README 的“无网络请求”重新成立。
+- 修改文件：`Package.swift`、中英文 README、`Sources/CThermalSensor/ThermalSensor.m`、App/Rendering/Metrics/USB 相关 Swift、`Sources/MacTR/Resources/Info.plist`、`script/build_and_run.sh`、`TASK_STATE.md`。
+- 未解决问题：当前没有连接 Thermalright LCD，真实握手、分批 bulk write/ACK 和端到端 LCD JPEG 帧率仍需接硬件后运行 `--benchmark`；系统 Homebrew libusb 的 macOS 26 link warning 仍存在，但打包继续优先嵌入既有 macOS 15 vendored dylib。
+- 验证结果：release 构建、`bash -n`、plist lint、`git diff --check`、Sparkle URL/符号/框架缺失检查和 `codesign --verify --deep --strict` 通过；真实本地数据与 quota/activity 初次解析成功，1920×480 snapshot 目检正常；同尺寸 10 FPS 渲染循环实测 5.6%/7.1% CPU，正常可见预览五次采样为 0.0/3.7/0.0/5.9/4.8%，相较修改前 14.8% 基线显著下降；稳态 5 秒 sample 中未出现渐变重画、`attributesOfItem`、GPU SMC 调用或 HID Product 查询，`readThermalSensors` 仅 2 个采样；Thread Sanitizer snapshot 无 race 报告；强制触发 JPEG 质量递减的 smoke benchmark 从首帧 38.79ms 降到同输出第二帧 1.68ms。
+
 ## 2026-08-12 交付 Dock 应用、启动预览与 App 图标
 
 - 完成内容：将 MacTR 从仅菜单栏的 accessory 激活策略改为普通 Dock 应用；GUI 每次启动时立即显示 `MacTR Preview` 主窗口，不再受旧的断连自动预览偏好影响；新增 MacTR 专用 PNG/ICNS 图标和可重复的自包含 App 构建入口。

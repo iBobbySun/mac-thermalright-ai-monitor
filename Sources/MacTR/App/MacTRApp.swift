@@ -7,7 +7,6 @@
 
 import AppKit
 import os
-import Sparkle
 import SwiftUI
 
 private let mactrLogger = Logger(subsystem: "com.beret21.MacTR", category: "main")
@@ -137,7 +136,9 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var window: NSWindow!
     private var imageView: NSImageView!
     private let renderer = MonitorRenderer()
+    private let renderQueue = DispatchQueue(label: "com.thermalvision.standalone-preview-render")
     private var timer: Timer?
+    private var renderInFlight = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("[Preview] Starting preview window (no LCD)")
@@ -177,8 +178,23 @@ final class PreviewController: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     private func refresh() {
-        guard let image = renderer.render() else { return }
-        imageView.image = NSImage(cgImage: image, size: imageSize(image))
+        guard !renderInFlight,
+              window.isVisible,
+              !window.isMiniaturized,
+              window.occlusionState.contains(.visible)
+        else { return }
+
+        renderInFlight = true
+        let renderer = renderer
+        renderQueue.async { [weak self] in
+            let image = renderer.render()
+            Task { @MainActor in
+                guard let self else { return }
+                self.renderInFlight = false
+                guard let image else { return }
+                self.imageView.image = NSImage(cgImage: image, size: imageSize(image))
+            }
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -202,18 +218,12 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var previewImageView: NSImageView?
     private var previewTimer: Timer?
     private var previewUpdatesEnabled = false
+    private var previewRenderInFlight = false
 
     private enum PreviewRefresh {
         static let animatedInterval: TimeInterval = 0.1  // 10fps while breathing/blinking
         static let idleInterval: TimeInterval = 0.5      // 2fps for metrics/clock updates
     }
-
-    // Sparkle auto-updater — only start when running from a real .app bundle;
-    // a bare `swift build` binary has no Info.plist for Sparkle to work with
-    private let updaterController = SPUStandardUpdaterController(
-        startingUpdater: Bundle.main.bundleIdentifier != nil
-            && Bundle.main.bundlePath.hasSuffix(".app"),
-        updaterDelegate: nil, userDriverDelegate: nil)
 
     // Menu items that need updating
     private var statusMenuItem: NSMenuItem!
@@ -221,7 +231,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var reconnectItem: NSMenuItem!
     private var autoPreviewItem: NSMenuItem!
     private var previewAlwaysOnTopItem: NSMenuItem!
-    private var updateTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("[*] MacTR starting...")
@@ -262,17 +271,9 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         appState.start()
         showPreview()
 
-        // Timer to refresh menu + icon
-        updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.updateIcon()
-                self?.updateMenuItems()
-            }
-        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        updateTimer?.invalidate()
         previewUpdatesEnabled = false
         previewTimer?.invalidate()
         previewTimer = nil
@@ -408,14 +409,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         menu.addItem(.separator())
 
-        // Check for Updates
-        let checkUpdatesItem = NSMenuItem(
-            title: "Check for Updates...",
-            action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
-            keyEquivalent: "u")
-        checkUpdatesItem.target = updaterController
-        menu.addItem(checkUpdatesItem)
-
         // About
         let aboutItem = NSMenuItem(title: "About MacTR", action: #selector(showAbout), keyEquivalent: "")
         aboutItem.target = self
@@ -512,10 +505,22 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard let previewWindow,
               previewWindow.isVisible,
               !previewWindow.isMiniaturized,
-              previewWindow.occlusionState.contains(.visible)
+              previewWindow.occlusionState.contains(.visible),
+              !previewRenderInFlight
         else { return }
-        guard let image = appState.currentFrame() else { return }
-        previewImageView?.image = NSImage(cgImage: image, size: imageSize(image))
+
+        previewRenderInFlight = true
+        appState.requestPreviewFrame { [weak self] image in
+            Task { @MainActor in
+                guard let self else { return }
+                self.previewRenderInFlight = false
+                guard self.previewUpdatesEnabled,
+                      let image,
+                      self.previewWindow?.isVisible == true
+                else { return }
+                self.previewImageView?.image = NSImage(cgImage: image, size: imageSize(image))
+            }
+        }
     }
 
     private func resizePreviewForCurrentSettings() {
@@ -552,6 +557,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == previewWindow else { return }
         previewUpdatesEnabled = false
+        previewRenderInFlight = false
         previewTimer?.invalidate()
         previewTimer = nil
         PreviewAlwaysOnTop.autoShowWhenLCDDisconnected = false

@@ -141,12 +141,24 @@ final class USBDevice: @unchecked Sendable {
     // MARK: - Transfers
 
     func bulkWrite(_ data: Data, timeout: UInt32 = 5000) throws -> Int {
+        try bulkWrite(data, range: data.startIndex..<data.endIndex, timeout: timeout)
+    }
+
+    /// Write a range of an existing buffer without materializing `Data(slice)`.
+    func bulkWrite(_ data: Data, range: Range<Int>, timeout: UInt32 = 5000) throws -> Int {
+        guard range.lowerBound >= data.startIndex,
+              range.upperBound <= data.endIndex,
+              !range.isEmpty
+        else { return 0 }
+
+        let byteOffset = data.distance(from: data.startIndex, to: range.lowerBound)
         var transferred: Int32 = 0
         let result = data.withUnsafeBytes { ptr in
             let mutable = UnsafeMutablePointer(
-                mutating: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self))
+                mutating: ptr.baseAddress!.advanced(by: byteOffset)
+                    .assumingMemoryBound(to: UInt8.self))
             return libusb_bulk_transfer(
-                handle, epOut, mutable, Int32(data.count),
+                handle, epOut, mutable, Int32(range.count),
                 &transferred, timeout)
         }
         guard result == LIBUSB_SUCCESS.rawValue else {

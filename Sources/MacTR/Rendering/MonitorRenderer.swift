@@ -29,6 +29,50 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     // Reusable CGContext — avoids allocating 3.6MB every 0.5s (prevents CG raster data leak)
     private var reusableCtx: CGContext?
 
+    // The background gradient and three panel shells never change within a dashboard
+    // layout. Render them once and blit the resulting image on later frames.
+    private struct DashboardChromeKey: Equatable {
+        let width: Int
+        let height: Int
+        let cpuX: Int
+        let cpuY: Int
+        let cpuWidth: Int
+        let agentsX: Int
+        let agentsY: Int
+        let agentsWidth: Int
+        let memoryX: Int
+        let memoryY: Int
+        let memoryWidth: Int
+    }
+    private var dashboardChromeKey: DashboardChromeKey?
+    private var dashboardChromeImage: CGImage?
+
+    // render() refreshes this cache for the LCD loop. The preview asks for the same
+    // frame within one device frame interval instead of drawing the dashboard twice.
+    private var lastRenderedFrame: CGImage?
+    private var lastRenderedAt: TimeInterval = 0
+
+    // DateFormatter setup is relatively expensive. Rendering is serialized by
+    // renderMutex, so these immutable-format instances are safe to reuse.
+    private let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+    private let weekdayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateFormat = "EEEE"
+        return formatter
+    }()
+    private let clockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
     // Agent activity text is usually unchanged across many animation frames. Cache the
     // expensive AppKit width measurements, but cap both caches so session churn cannot
     // turn this always-on renderer into another source of long-term memory growth.
@@ -60,6 +104,12 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         lock.lock()
         agentDisplayConfig = config.normalized
         lock.unlock()
+
+        // Do not hand the preview a cached frame with the previous dimensions.
+        renderMutex.lock()
+        lastRenderedFrame = nil
+        lastRenderedAt = 0
+        renderMutex.unlock()
     }
 
     func frameSize() -> NSSize {
@@ -85,10 +135,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                    todayOutputTokens: u.todayOutputTokens,
                    secondsSinceActive: u.secondsSinceActive,
                    project: u.project, activity: u.activity,
-                   quotaUsedPercent: u.quotaUsedPercent,
-                   quotaResetsAt: u.quotaResetsAt,
-                   quotaResetIsEstimated: u.quotaResetIsEstimated,
-                   quotaWindowLabel: u.quotaWindowLabel,
+                   quotas: u.quotas,
                    needsAttention: true)
     }
 
@@ -226,9 +273,16 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                                | Collector | 解析消息与待办 |
                                | Renderer | 表格化排版 |
                                """,
-                               quotaUsedPercent: 18,
-                               quotaResetsAt: Date().addingTimeInterval(3 * 3600),
-                               quotaWindowLabel: "5小时",
+                               quotas: [
+                                   AgentQuota(usedPercent: 18,
+                                              resetsAt: Date().addingTimeInterval(3 * 3600),
+                                              resetIsEstimated: false,
+                                              windowLabel: "5小时"),
+                                   AgentQuota(usedPercent: 34,
+                                              resetsAt: Date().addingTimeInterval(6 * 24 * 3600),
+                                              resetIsEstimated: false,
+                                              windowLabel: "7天"),
+                               ],
                                isWorking: true,
                                stepCurrent: 3, stepTotal: 4,
                                stepText: "渲染 Claude 消息表格"),
@@ -245,9 +299,16 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                               | `web-client` | `9b0e17aa` | 32 |
                               | `job-worker` | `ac02bea6` | 88 |
                               """,
-                              quotaUsedPercent: 57,
-                              quotaResetsAt: Date().addingTimeInterval(3600 * 24 * 6),
-                              quotaWindowLabel: "7天",
+                              quotas: [
+                                  AgentQuota(usedPercent: nil,
+                                             resetsAt: nil,
+                                             resetIsEstimated: false,
+                                             windowLabel: "5小时"),
+                                  AgentQuota(usedPercent: 57,
+                                             resetsAt: Date().addingTimeInterval(3600 * 24 * 6),
+                                             resetIsEstimated: false,
+                                             windowLabel: "7天"),
+                              ],
                               isWorking: true,
                               stepCurrent: 4, stepTotal: 6,
                               stepText: "部署到预发环境并跑冒烟测试"))
@@ -256,6 +317,9 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     /// Render one demo frame with the showcase data (for --snapshot).
     func renderSimulated(coreCount: Int) -> CGImage? {
+        renderMutex.lock()
+        defer { renderMutex.unlock() }
+
         let (cpu, mem, temp, sys, agents) = demoData()
         let layout = dashboardLayout()
         let w = layout.width, h = layout.height
@@ -264,8 +328,10 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                                   bytesPerRow: w * 4, space: colorSpace,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
+        if let chrome = dashboardChrome(for: layout) {
+            ctx.draw(chrome, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
         ctx.translateBy(x: 0, y: CGFloat(h)); ctx.scaleBy(x: 1, y: -1)
-        Draw.gradientBackground(ctx, height: layout.height)
         renderCPU(ctx, cpu: cpu, temp: temp, layout: layout)
         renderAgents(ctx, agents: agents, layout: layout)
         renderMemory(ctx, mem: mem, sys: sys, layout: layout)
@@ -277,9 +343,28 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     // share reusableCtx + sparkline history
     private let renderMutex = NSLock()
 
+    /// Return the frame most recently produced by the LCD loop when it is still
+    /// fresh enough; otherwise render one frame on the caller's background queue.
+    func currentFrame(maxAge: TimeInterval) -> CGImage? {
+        renderMutex.lock()
+        defer { renderMutex.unlock() }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if let frame = lastRenderedFrame,
+           now - lastRenderedAt <= max(0, maxAge) {
+            return frame
+        }
+        return renderLocked(now: now)
+    }
+
     func render() -> CGImage? {
         renderMutex.lock()
         defer { renderMutex.unlock() }
+
+        return renderLocked(now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func renderLocked(now: TimeInterval) -> CGImage? {
 
         let cpu: CPUSnapshot, mem: MemorySnapshot, temp: TemperatureSnapshot
         let sys: SystemSnapshot?
@@ -320,13 +405,16 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         }
         guard let ctx = reusableCtx else { return nil }
 
-        // Reset transform and clear for new frame
+        // The opaque cached chrome replaces every pixel, so the reusable context does
+        // not need a separate clear. Draw it before applying the top-left flip used by
+        // the dynamic dashboard primitives.
+        if let chrome = dashboardChrome(for: layout) {
+            ctx.draw(chrome, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
         ctx.saveGState()
         ctx.translateBy(x: 0, y: CGFloat(h))
         ctx.scaleBy(x: 1, y: -1)
-
-        // Background
-        Draw.gradientBackground(ctx, height: layout.height)
 
         // Panels
         renderCPU(ctx, cpu: cpu, temp: temp, layout: layout)
@@ -335,6 +423,52 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
         let image = ctx.makeImage()
         ctx.restoreGState()
+        lastRenderedFrame = image
+        lastRenderedAt = now
+        return image
+    }
+
+    private func dashboardChrome(for layout: DashboardLayout) -> CGImage? {
+        let key = DashboardChromeKey(
+            width: layout.width,
+            height: layout.height,
+            cpuX: layout.cpuX,
+            cpuY: layout.cpuY,
+            cpuWidth: layout.cpuWidth,
+            agentsX: layout.agentsX,
+            agentsY: layout.agentsY,
+            agentsWidth: layout.agentsWidth,
+            memoryX: layout.memoryX,
+            memoryY: layout.memoryY,
+            memoryWidth: layout.memoryWidth)
+        if dashboardChromeKey == key, let dashboardChromeImage {
+            return dashboardChromeImage
+        }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: layout.width,
+            height: layout.height,
+            bitsPerComponent: 8,
+            bytesPerRow: layout.width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+
+        ctx.translateBy(x: 0, y: CGFloat(layout.height))
+        ctx.scaleBy(x: 1, y: -1)
+        Draw.gradientBackground(ctx, height: layout.height)
+        Draw.panel(ctx, x: layout.cpuX, y: layout.cpuY,
+                   w: layout.cpuWidth, h: Layout.panelHeight, accent: Color.blue)
+        Draw.panel(ctx, x: layout.agentsX, y: layout.agentsY,
+                   w: layout.agentsWidth, h: Layout.panelHeight, accent: Color.purple)
+        Draw.panel(ctx, x: layout.memoryX, y: layout.memoryY,
+                   w: layout.memoryWidth, h: Layout.panelHeight, accent: Color.green)
+
+        let image = ctx.makeImage()
+        dashboardChromeKey = key
+        dashboardChromeImage = image
         return image
     }
 
@@ -347,7 +481,6 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let py = layout.cpuY
         let ph = Layout.panelHeight
 
-        Draw.panel(ctx, x: x, y: py, w: pw, h: ph, accent: Color.blue)
         Draw.text(ctx, "CPU", x: x + 20, y: py + 14, font: Fonts.system(24, weight: .bold), color: Color.blue)
         // Arc gauge
         let gcx = x + 100, gcy = py + 138
@@ -441,7 +574,6 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let totalGB = Double(mem.total) / (1024 * 1024 * 1024)
         let pct = mem.percent
 
-        Draw.panel(ctx, x: x, y: py, w: pw, h: Layout.panelHeight, accent: Color.green)
         Draw.text(ctx, "MEMORY", x: x + 20, y: py + 14,
                   font: Fonts.system(24, weight: .bold), color: Color.green)
         Draw.text(ctx, String(format: "%.0f GB", totalGB), x: x + pw - 75, y: py + 16,
@@ -501,14 +633,11 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: cx0 + cw, y: dividerY), color: Color.border)
 
         // Date, weekday, uptime, processes
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US")
+        let now = Date()
         let ix = x + 20
-        formatter.dateFormat = "yyyy-MM-dd"
-        Draw.text(ctx, formatter.string(from: Date()), x: ix, y: py + ph - 196,
+        Draw.text(ctx, dateFormatter.string(from: now), x: ix, y: py + ph - 196,
                   font: Fonts.system(22, weight: .semibold), color: Color.textW)
-        formatter.dateFormat = "EEEE"
-        Draw.text(ctx, formatter.string(from: Date()), x: ix, y: py + ph - 170,
+        Draw.text(ctx, weekdayFormatter.string(from: now), x: ix, y: py + ph - 170,
                   font: Fonts.system(16), color: Color.textS)
 
         let iw = pw - (ix - x) - 16
@@ -526,8 +655,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         }
 
         // Clock — big, centered across the full panel width, below the divider
-        formatter.dateFormat = "HH:mm:ss"
-        Draw.centeredText(ctx, formatter.string(from: Date()),
+        Draw.centeredText(ctx, clockFormatter.string(from: now),
                           cx: x + pw / 2, y: dividerY + 30,
                           font: Fonts.system(66, weight: .medium), color: Color.textW)
     }
@@ -543,7 +671,6 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let py = layout.agentsY
         let ph = Layout.panelHeight
 
-        Draw.panel(ctx, x: x, y: py, w: pw, h: ph, accent: Color.purple)
         Draw.text(ctx, visibleAgents.count == 1 ? "AI AGENT" : "AI AGENTS", x: x + 20, y: py + 14,
                   font: Fonts.system(24, weight: .bold), color: Color.purple)
 
@@ -591,6 +718,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     private func renderCompactAgentCard(_ ctx: CGContext, x: Int, y: Int, w: Int, h: Int,
                                         name: String, accent: CGColor, usage: AgentUsage) {
+        let quotas = quotaPresentations(usage)
         let t = Date().timeIntervalSince1970
         let blinkOn = Int(t * 2) % 2 == 0
         let phase = t.truncatingRemainder(dividingBy: 5) / 5
@@ -654,23 +782,26 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             cy += 30
         }
 
-        if let cur = usage.stepCurrent, let total = usage.stepTotal, total > 0 {
+        if quotas.count == 1,
+           let cur = usage.stepCurrent, let total = usage.stepTotal, total > 0 {
             drawStepBar(ctx, x: innerX, y: cy, w: innerW, current: cur, total: total, accent: accent)
             cy += 16
         }
 
-        // Reserve an explicit quota row at the bottom. The old compact layout only
-        // drew an unlabeled bar, so neither remaining allowance nor reset date was visible.
-        let tokenY = y + h - 90
-        renderMessage(ctx, text: usage.activity ?? (usage.available ? "空闲" : "—"),
-                      x: innerX, y: cy, w: innerW, bottom: tokenY - 8, accent: accent)
+        // Two Claude windows consume the compact card's former activity-text slot.
+        // Project, plan badge, token totals, and both quota rows remain visible.
+        let tokenY = quotas.count > 1 ? y + h - 116 : y + h - 90
+        if quotas.count == 1 {
+            renderMessage(ctx, text: usage.activity ?? (usage.available ? "空闲" : "—"),
+                          x: innerX, y: cy, w: innerW, bottom: tokenY - 8, accent: accent)
+        }
 
         Draw.line(ctx, from: CGPoint(x: innerX, y: tokenY - 8),
                   to: CGPoint(x: innerX + innerW, y: tokenY - 8), color: Color.border)
         Draw.text(ctx, "今日 Token", x: innerX, y: tokenY,
                   font: Fonts.system(15), color: Color.textL)
         Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: innerX, y: tokenY + 18,
-                  font: Fonts.system(27, weight: .bold), color: Color.textW)
+                  font: Fonts.system(quotas.count > 1 ? 22 : 27, weight: .bold), color: Color.textW)
 
         let ioFont = Fonts.system(15, weight: .medium)
         let rows: [(String, UInt64)] = [
@@ -688,18 +819,21 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                       font: ioFont, color: Color.textL)
         }
 
-        let quota = quotaPresentation(usage)
-        let quotaY = y + h - 36
-        Draw.text(ctx, quota.remainingText, x: innerX, y: quotaY,
-                  font: Fonts.system(15, weight: .semibold), color: quota.color)
-        let resetFont = Fonts.system(13)
-        let resetW = (quota.resetText as NSString).size(withAttributes: [.font: resetFont]).width
-        Draw.text(ctx, quota.resetText,
-                  x: Int(CGFloat(innerX + innerW) - resetW), y: quotaY + 2,
-                  font: resetFont,
-                  color: usage.quotaResetsAt == nil ? Color.textD : Color.textS)
-        Draw.bar(ctx, x: innerX, y: y + h - 9, w: innerW, h: 5,
-                 percent: quota.remaining ?? 0, color: quota.color)
+        let quotaStride = 36
+        let firstQuotaY = y + h - 36 - (quotas.count - 1) * quotaStride
+        for (index, quota) in quotas.enumerated() {
+            let quotaY = firstQuotaY + index * quotaStride
+            Draw.text(ctx, quota.remainingText, x: innerX, y: quotaY,
+                      font: Fonts.system(15, weight: .semibold), color: quota.color)
+            let resetFont = Fonts.system(13)
+            let resetW = (quota.resetText as NSString).size(withAttributes: [.font: resetFont]).width
+            Draw.text(ctx, quota.resetText,
+                      x: Int(CGFloat(innerX + innerW) - resetW), y: quotaY + 2,
+                      font: resetFont,
+                      color: quota.hasReset ? Color.textS : Color.textD)
+            Draw.bar(ctx, x: innerX, y: quotaY + 27, w: innerW, h: 5,
+                     percent: quota.remaining ?? 0, color: quota.color)
+        }
     }
 
     private func renderAgentColumn(_ ctx: CGContext, x: Int, w: Int, py: Int,
@@ -798,12 +932,14 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
         // Latest message — what the agent last said (never the commands it ran).
         // Markdown tables/lists are laid out structurally; plain text just wraps.
+        let quotas = quotaPresentations(usage)
+        let extraQuotaHeight = max(0, quotas.count - 1) * 40
         let actText = usage.activity ?? (usage.available ? "空闲" : "—")
-        let msgBottom = py + ph - 140   // token divider sits here
+        let msgBottom = py + ph - 140 - extraQuotaHeight
         renderMessage(ctx, text: actText, x: x, y: y, w: w, bottom: msgBottom, accent: accent)
 
         // Token usage — large, anchored near the bottom of the column
-        let tokY = py + ph - 126
+        let tokY = py + ph - 126 - extraQuotaHeight
         Draw.line(ctx, from: CGPoint(x: x, y: tokY - 12),
                   to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
         Draw.text(ctx, "今日 Token", x: x, y: tokY,
@@ -828,26 +964,42 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                       font: ioFont, color: Color.textL)
         }
 
-        // Quota: always reserve the row so missing local data is explicit rather
-        // than silently disappearing. Reset is an absolute local date/time.
-        let quota = quotaPresentation(usage)
-        let qy = tokY + 78
-        Draw.text(ctx, quota.remainingText, x: x, y: qy,
-                  font: Fonts.system(21, weight: .medium), color: quota.color)
-        let resetFont = Fonts.system(17)
-        let resetW = (quota.resetText as NSString).size(withAttributes: [.font: resetFont]).width
-        Draw.text(ctx, quota.resetText, x: Int(CGFloat(x + w) - resetW), y: qy + 3,
-                  font: resetFont,
-                  color: usage.quotaResetsAt == nil ? Color.textD : Color.textS)
-        Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
-                 percent: quota.remaining ?? 0, color: quota.color)
+        // Quota rows are anchored at the bottom. Both agents reserve 5-hour and
+        // 7-day entries; an unavailable plan window stays visible as "--".
+        for (index, quota) in quotas.enumerated() {
+            let qy = tokY + 78 + index * 40
+            Draw.text(ctx, quota.remainingText, x: x, y: qy,
+                      font: Fonts.system(21, weight: .medium), color: quota.color)
+            let resetFont = Fonts.system(17)
+            let resetW = (quota.resetText as NSString).size(withAttributes: [.font: resetFont]).width
+            Draw.text(ctx, quota.resetText, x: Int(CGFloat(x + w) - resetW), y: qy + 3,
+                      font: resetFont,
+                      color: quota.hasReset ? Color.textS : Color.textD)
+            Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
+                     percent: quota.remaining ?? 0, color: quota.color)
+        }
     }
 
-    private func quotaPresentation(_ usage: AgentUsage)
-        -> (remaining: Double?, remainingText: String, resetText: String, color: CGColor) {
-        let window = usage.quotaWindowLabel ?? ""
+    private struct QuotaPresentation {
+        let remaining: Double?
+        let remainingText: String
+        let resetText: String
+        let color: CGColor
+        let hasReset: Bool
+    }
+
+    private func quotaPresentations(_ usage: AgentUsage) -> [QuotaPresentation] {
+        let quotas = usage.quotas.isEmpty
+            ? [AgentQuota(usedPercent: nil, resetsAt: nil,
+                          resetIsEstimated: false, windowLabel: "额度")]
+            : usage.quotas
+        return quotas.map(quotaPresentation)
+    }
+
+    private func quotaPresentation(_ quota: AgentQuota) -> QuotaPresentation {
+        let window = quota.windowLabel
         let prefix = window.isEmpty || window == "额度" ? "" : "\(window) "
-        let remaining = usage.quotaUsedPercent.map { min(max(100 - $0, 0), 100) }
+        let remaining = quota.usedPercent.map { min(max(100 - $0, 0), 100) }
         let remainingText = remaining.map { String(format: "\(prefix)剩余 %.0f%%", $0) }
             ?? "\(prefix)剩余 --"
         let color: CGColor
@@ -857,15 +1009,17 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             color = Color.textD
         }
         let resetText: String
-        if let reset = usage.quotaResetsAt {
+        if let reset = quota.resetsAt {
             let c = Calendar.current.dateComponents([.month, .day, .hour, .minute], from: reset)
-            let label = usage.quotaResetIsEstimated ? "预计重置" : "重置"
+            let label = quota.resetIsEstimated ? "预计重置" : "重置"
             resetText = String(format: "\(label) %02d-%02d %02d:%02d",
                                c.month ?? 0, c.day ?? 0, c.hour ?? 0, c.minute ?? 0)
         } else {
             resetText = "重置 --"
         }
-        return (remaining, remainingText, resetText, color)
+        return QuotaPresentation(remaining: remaining, remainingText: remainingText,
+                                 resetText: resetText, color: color,
+                                 hasReset: quota.resetsAt != nil)
     }
 
     /// Segmented plan-progress bar: completed steps solid, current bright, pending dim.

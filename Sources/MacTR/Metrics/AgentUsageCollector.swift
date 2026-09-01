@@ -7,12 +7,19 @@
 //   Quota:  Claude Desktop usage history/audit + latest standard Codex rate-limit event
 //
 // Files are read incrementally (per-file byte offsets) so the steady-state
-// cost per tick is a stat() per candidate file plus any appended bytes —
+// cost per tick is one directory metadata snapshot plus any appended bytes —
 // full parses happen only on first scan and day rollover.
 
 import Foundation
 
 // MARK: - Data Structures
+
+struct AgentQuota: Sendable {
+    let usedPercent: Double?        // rate-limit window usage, 0...100
+    let resetsAt: Date?
+    let resetIsEstimated: Bool      // true when inferred from local window samples
+    let windowLabel: String         // e.g. "5小时" / "7天"
+}
 
 struct AgentUsage: Sendable {
     let available: Bool             // data directory exists at all
@@ -21,10 +28,7 @@ struct AgentUsage: Sendable {
     let secondsSinceActive: Int?    // nil = no session today
     let project: String?            // cwd basename of most recent session
     let activity: String?           // latest tool call / message summary
-    let quotaUsedPercent: Double?   // selected rate-limit window usage, 0...100
-    let quotaResetsAt: Date?
-    let quotaResetIsEstimated: Bool // true when inferred from local window samples
-    let quotaWindowLabel: String?   // e.g. "5小时" / "7天"
+    let quotas: [AgentQuota]
     let needsAttention: Bool        // turn finished / waiting for user — flash the column
     let isWorking: Bool             // actively running a turn — slow breathing background
     let stepCurrent: Int?           // active plan step (1-based); nil = no plan
@@ -34,9 +38,7 @@ struct AgentUsage: Sendable {
 
     init(available: Bool, todayInputTokens: UInt64, todayOutputTokens: UInt64,
          secondsSinceActive: Int?, project: String?, activity: String?,
-         quotaUsedPercent: Double? = nil, quotaResetsAt: Date? = nil,
-         quotaResetIsEstimated: Bool = false,
-         quotaWindowLabel: String? = nil,
+         quotas: [AgentQuota] = [],
          needsAttention: Bool = false, isWorking: Bool = false,
          stepCurrent: Int? = nil, stepTotal: Int? = nil, stepText: String? = nil) {
         self.available = available
@@ -45,10 +47,7 @@ struct AgentUsage: Sendable {
         self.secondsSinceActive = secondsSinceActive
         self.project = project
         self.activity = activity
-        self.quotaUsedPercent = quotaUsedPercent
-        self.quotaResetsAt = quotaResetsAt
-        self.quotaResetIsEstimated = quotaResetIsEstimated
-        self.quotaWindowLabel = quotaWindowLabel
+        self.quotas = quotas
         self.needsAttention = needsAttention
         self.isWorking = isWorking
         self.stepCurrent = stepCurrent
@@ -68,6 +67,88 @@ final class AgentUsageCollector: @unchecked Sendable {
 
     private let fm = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
+    private let fileResourceKeys: Set<URLResourceKey> = [
+        .isRegularFileKey, .contentModificationDateKey, .fileSizeKey,
+    ]
+
+    private lazy var localDayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+    private lazy var sessionDayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy/MM/dd"
+        return formatter
+    }()
+    private lazy var timestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private struct FileStamp: Equatable {
+        let modificationDate: Date
+        let size: UInt64
+    }
+
+    private struct SessionFile {
+        let path: String
+        let modificationDate: Date
+        let size: UInt64
+        var stamp: FileStamp { FileStamp(modificationDate: modificationDate, size: size) }
+    }
+
+    private typealias ClaudeRateLimitReading = (
+        type: String?, used: Double?, resets: Date?, timestamp: String
+    )
+    private struct CachedClaudeReadings {
+        let stamp: FileStamp
+        let readings: [ClaudeRateLimitReading]
+    }
+
+    /// A reset boundary carried across launches so it outlives the source that
+    /// produced it — Claude Desktop's history stops sampling while the app is closed,
+    /// and a 429's `quotaLimits` block scrolls out of the transcript tail.
+    private struct PersistedReset {
+        let resetsAt: Date
+        let isEstimated: Bool
+    }
+
+    private static let fiveHourTypes: Set<String> = ["five_hour"]
+    private static let sevenDayTypes: Set<String> = [
+        "seven_day", "seven_day_opus", "seven_day_sonnet",
+        "seven_day_oauth_apps", "seven_day_overage_included",
+    ]
+    private static let sevenDayWindow: TimeInterval = 7 * 24 * 60 * 60
+    private static let quotaLimitScanFileLimit = 24
+    private static let quotaLimitInitialScanBytes: UInt64 = 2 * 1024 * 1024
+    private static let fiveHourWindowKey = "claudeQuota.fiveHour"
+    private static let sevenDayWindowKey = "claudeQuota.sevenDay"
+    private static let resetsAtSuffix = ".resetsAt"
+    private static let estimatedSuffix = ".estimated"
+
+    private struct CodexQuotaReading {
+        let quotas: [AgentQuota]
+        let timestamp: String
+    }
+    private struct CachedCodexQuotaFile {
+        let stamp: FileStamp
+        let reading: CodexQuotaReading?
+    }
+
+    // Session directories older than yesterday cannot receive a cross-midnight active
+    // session append under Codex's current file layout, so cache their prefetched URL
+    // metadata after the first scan. If Codex starts resuming older session files, this
+    // cache must be invalidated or removed.
+    private var historicalCodexFiles: [String: [SessionFile]] = [:]
+    private var claudeAuditCache: [String: CachedClaudeReadings] = [:]
+    // Rejected-request readings are accumulated across ticks rather than re-derived:
+    // offsets advance past lines already seen, and the newest reading per rate-limit
+    // type is retained for the lifetime of the process.
+    private var claudeQuotaLimitOffsets: [String: UInt64] = [:]
+    private var claudeQuotaLimitByType: [String: ClaudeRateLimitReading] = [:]
+    private var codexQuotaFileCache: [String: CachedCodexQuotaFile] = [:]
 
     // Incremental state, reset on day rollover
     private var dayKey = ""
@@ -89,18 +170,27 @@ final class AgentUsageCollector: @unchecked Sendable {
     private var codexAttentionSince: Date?
 
     // Claude Desktop writes small, local-only usage samples plus the active limit's
-    // reset time. Cache the selected (representative) window so the high-frequency
-    // metrics loop does not repeatedly traverse Desktop session directories.
-    private var claudeQuotaCache: (used: Double, resets: Date?, resetIsEstimated: Bool,
-                                   window: String)?
+    // reset time. Cache both plan windows so the high-frequency metrics loop does not
+    // repeatedly traverse Desktop session directories.
+    private var claudeQuotaCache: [AgentQuota] = [
+        AgentQuota(usedPercent: nil, resetsAt: nil,
+                   resetIsEstimated: false, windowLabel: "5小时"),
+        AgentQuota(usedPercent: nil, resetsAt: nil,
+                   resetIsEstimated: false, windowLabel: "7天"),
+    ]
     private var claudeQuotaLastRefresh: Date?
     private let claudeQuotaRefreshInterval: TimeInterval = 5 * 60
 
     // Last-known Codex quota (account-global). The full rate-limit block appears only
     // occasionally and the newest reading may be in a different file than the active
     // one, so we track the newest-by-timestamp across recent files and cache it.
-    private var codexQuotaCache: (used: Double, resets: Date?, window: String)?
-    private var codexQuotaTS = ""            // newest reading's timestamp seen so far
+    private var codexQuotaCache: [AgentQuota] = [
+        AgentQuota(usedPercent: nil, resetsAt: nil,
+                   resetIsEstimated: false, windowLabel: "5小时"),
+        AgentQuota(usedPercent: nil, resetsAt: nil,
+                   resetIsEstimated: false, windowLabel: "7天"),
+    ]
+    private var codexQuotaTS = ""            // process-lifetime timestamp high-water mark
     private var codexQuotaLastRefresh: Date?
     private let codexQuotaRefreshInterval: TimeInterval = 5 * 60
 
@@ -113,15 +203,11 @@ final class AgentUsageCollector: @unchecked Sendable {
     /// UTC ISO8601 ("...Z"), so "today" = lexical compare against the local
     /// midnight rendered in UTC.
     private func rolloverIfNeeded() {
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        let key = df.string(from: Date())
+        let key = localDayFormatter.string(from: Date())
         guard key != dayKey else { return }
         dayKey = key
 
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        todayStartISO = iso.string(from: Calendar.current.startOfDay(for: Date()))
+        todayStartISO = timestampFormatter.string(from: Calendar.current.startOfDay(for: Date()))
 
         claudeOffsets = [:]; claudeSeenIDs = []; claudeInput = 0; claudeOutput = 0
         codexOffsets = [:]; codexInput = 0; codexOutput = 0
@@ -136,9 +222,7 @@ final class AgentUsageCollector: @unchecked Sendable {
         guard fm.fileExists(atPath: root) else {
             return AgentUsage(available: false, todayInputTokens: 0, todayOutputTokens: 0,
                               secondsSinceActive: nil, project: nil, activity: nil,
-                              quotaUsedPercent: quota?.used, quotaResetsAt: quota?.resets,
-                              quotaResetIsEstimated: quota?.resetIsEstimated ?? false,
-                              quotaWindowLabel: quota?.window)
+                              quotas: quota)
         }
 
         let todayStart = Calendar.current.startOfDay(for: Date())
@@ -147,20 +231,17 @@ final class AgentUsageCollector: @unchecked Sendable {
 
         for projDir in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
             let dirPath = root + "/" + projDir
-            for file in (try? fm.contentsOfDirectory(atPath: dirPath)) ?? [] {
-                guard file.hasSuffix(".jsonl") else { continue }
-                let path = dirPath + "/" + file
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let mtime = attrs[.modificationDate] as? Date
-                else { continue }
+            for file in sessionFiles(in: dirPath, cacheHistorical: false) {
                 // Latest session overall (any day) — drives the activity/project
                 // display so the column isn't blank on a day with no runs yet
-                if mtime > latestMtime { latestMtime = mtime; latestPath = path }
+                if file.modificationDate > latestMtime {
+                    latestMtime = file.modificationDate
+                    latestPath = file.path
+                }
 
                 // Token counting is scoped to today only
-                guard mtime >= todayStart else { continue }
-                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-                consumeNewLines(path: path, size: size, offsets: &claudeOffsets,
+                guard file.modificationDate >= todayStart else { continue }
+                consumeNewLines(path: file.path, size: file.size, offsets: &claudeOffsets,
                                 prefilter: "\"type\":\"assistant\"") { line in
                     self.accumulateClaudeLine(line)
                 }
@@ -196,9 +277,7 @@ final class AgentUsageCollector: @unchecked Sendable {
                           todayOutputTokens: claudeOutput,
                           secondsSinceActive: secondsAgo,
                           project: project, activity: activity,
-                          quotaUsedPercent: quota?.used, quotaResetsAt: quota?.resets,
-                          quotaResetIsEstimated: quota?.resetIsEstimated ?? false,
-                          quotaWindowLabel: quota?.window,
+                          quotas: quota,
                           needsAttention: attention, isWorking: working,
                           stepCurrent: step?.current, stepTotal: step?.total,
                           stepText: step?.text)
@@ -221,77 +300,129 @@ final class AgentUsageCollector: @unchecked Sendable {
         claudeOutput += uint(usage["output_tokens"])
     }
 
-    /// Claude Desktop persists plan utilization locally in `plan-usage-history.json`.
-    /// Its session audit supplies the representative rate-limit type and reset epoch.
-    /// Both reads are local and credential-free; no API request or subprocess is used.
+    /// Claude Desktop persists plan utilization locally in `plan-usage-history.json`,
+    /// but that file carries percentages only. Exact reset epochs come from the two
+    /// places Claude records the server's answer: a rejected request's `quotaLimits`
+    /// block in the session transcript, and — on Desktop builds before 1.34493 —
+    /// `rate_limit_info` in the session audit. Whatever is resolved is persisted, so a
+    /// boundary observed once survives Claude Desktop being closed (which stops the
+    /// history sampling that the estimator depends on).
+    /// Every read is local and credential-free; no API request or subprocess is used.
     private func updateClaudeQuota() {
         if let last = claudeQuotaLastRefresh,
            Date().timeIntervalSince(last) < claudeQuotaRefreshInterval {
             return
         }
         claudeQuotaLastRefresh = Date()
-
-        let historyPath = home + "/Library/Application Support/Claude/plan-usage-history.json"
-        guard let data = fm.contents(atPath: historyPath),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let samples = root["samples"] as? [[String: Any]]
-        else { return }
+        let now = Date()
 
         var historySamples: [(date: Date, fiveHour: Double?, sevenDay: Double?)] = []
-        for sample in samples {
-            guard var epoch = (sample["t"] as? NSNumber)?.doubleValue,
-                  let usage = sample["u"] as? [String: Any], !usage.isEmpty
-            else { continue }
-            if epoch > 10_000_000_000 { epoch /= 1000 }
-            historySamples.append((
-                Date(timeIntervalSince1970: epoch),
-                (usage["fh"] as? NSNumber)?.doubleValue,
-                (usage["sd"] as? NSNumber)?.doubleValue
-            ))
-        }
-        historySamples.sort { $0.date < $1.date }
-        guard let latest = historySamples.last else { return }
-
-        let fiveHour = latest.fiveHour
-        let sevenDay = latest.sevenDay
-        let rate = latestClaudeRateLimit()
-        let now = Date()
-        // Claude Desktop 1.34493 stopped appending fresh rate-limit audit events.
-        // An expired audit record remains useful history, but must not dictate the
-        // active quota window or be shown as today's reset time.
-        let activeRate = rate.flatMap { reading -> (type: String?, used: Double?,
-                                                    resets: Date?, timestamp: String)? in
-            guard let reset = reading.resets, reset > now else { return nil }
-            return reading
-        }
-
-        let used: Double?
-        let window: String
-        switch activeRate?.type {
-        case "five_hour":
-            used = activeRate?.used ?? fiveHour
-            window = "5小时"
-        case "seven_day", "seven_day_opus", "seven_day_sonnet":
-            used = activeRate?.used ?? sevenDay
-            window = "7天"
-        default:
-            // If the audit has not emitted a representative claim yet, show the
-            // tighter of the two locally sampled windows rather than guessing.
-            if let fh = fiveHour, fh >= (sevenDay ?? -1) {
-                used = fh; window = "5小时"
-            } else {
-                used = sevenDay; window = "7天"
+        let historyPath = home + "/Library/Application Support/Claude/plan-usage-history.json"
+        if let data = fm.contents(atPath: historyPath),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let samples = root["samples"] as? [[String: Any]] {
+            for sample in samples {
+                guard var epoch = (sample["t"] as? NSNumber)?.doubleValue,
+                      let usage = sample["u"] as? [String: Any], !usage.isEmpty
+                else { continue }
+                if epoch > 10_000_000_000 { epoch /= 1000 }
+                historySamples.append((
+                    Date(timeIntervalSince1970: epoch),
+                    (usage["fh"] as? NSNumber)?.doubleValue,
+                    (usage["sd"] as? NSNumber)?.doubleValue
+                ))
             }
+            historySamples.sort { $0.date < $1.date }
         }
-        guard let used else { return }
-        let exactReset = activeRate?.resets
-        let estimatedReset = exactReset == nil && window == "5小时"
+        let latest = historySamples.last
+
+        // An expired reading remains useful history but must not dictate the active
+        // window, so `newestReading` keeps only resets that are still ahead of us.
+        let readings = claudeRateLimitReadings() + claudeQuotaLimitReadings()
+        let fiveHourReading = newestReading(readings, matching: Self.fiveHourTypes, now: now)
+        let sevenDayReading = newestReading(readings, matching: Self.sevenDayTypes, now: now)
+
+        let estimatedFiveHour = fiveHourReading == nil
             ? estimatedFiveHourReset(
                 samples: historySamples.map { ($0.date, $0.fiveHour) }, now: now
             )
             : nil
-        claudeQuotaCache = (min(max(used, 0), 100), exactReset ?? estimatedReset,
-                            exactReset == nil && estimatedReset != nil, window)
+        let fiveHourReset = resolveReset(window: Self.fiveHourWindowKey,
+                                         exact: fiveHourReading?.resets,
+                                         estimate: estimatedFiveHour)
+        let sevenDayReset = resolveReset(window: Self.sevenDayWindowKey,
+                                         exact: sevenDayReading?.resets,
+                                         estimate: nil)
+
+        let fiveHourUsed = fiveHourReading.flatMap { $0.used } ?? latest?.fiveHour
+        let sevenDayUsed = sevenDayReading.flatMap { $0.used } ?? latest?.sevenDay
+
+        claudeQuotaCache = [
+            AgentQuota(
+                usedPercent: fiveHourUsed.map { min(max($0, 0), 100) },
+                resetsAt: fiveHourReset?.resetsAt,
+                resetIsEstimated: fiveHourReset?.isEstimated ?? false,
+                windowLabel: "5小时"),
+            AgentQuota(
+                usedPercent: sevenDayUsed.map { min(max($0, 0), 100) },
+                resetsAt: sevenDayReset?.resetsAt,
+                resetIsEstimated: sevenDayReset?.isEstimated ?? false,
+                windowLabel: "7天"),
+        ]
+    }
+
+    /// Newest still-active reading for one window family.
+    private func newestReading(_ readings: [ClaudeRateLimitReading],
+                               matching types: Set<String>,
+                               now: Date) -> ClaudeRateLimitReading? {
+        var best: ClaudeRateLimitReading?
+        for reading in readings {
+            guard let type = reading.type, types.contains(type),
+                  let resets = reading.resets, resets > now else { continue }
+            if best == nil || reading.timestamp > best!.timestamp { best = reading }
+        }
+        return best
+    }
+
+    /// Merge a freshly derived boundary with the stored one. An exact reading always
+    /// wins; an estimate only replaces another estimate, so a known-good epoch is not
+    /// downgraded when the 429 that produced it scrolls out of the scan window. A
+    /// stored boundary that has passed is dropped — the window has rolled over.
+    private func resolveReset(window: String, exact: Date?, estimate: Date?) -> PersistedReset? {
+        let now = Date()
+        let stored = loadPersistedReset(window)
+        let active = stored.flatMap { $0.resetsAt > now ? $0 : nil }
+        var resolved = active
+        if let exact, exact > now {
+            resolved = PersistedReset(resetsAt: exact, isEstimated: false)
+        } else if let estimate, estimate > now, active?.isEstimated ?? true {
+            resolved = PersistedReset(resetsAt: estimate, isEstimated: true)
+        }
+        // Comparing against the raw stored value also clears a boundary that has
+        // passed with nothing to replace it yet.
+        if resolved?.resetsAt != stored?.resetsAt || resolved?.isEstimated != stored?.isEstimated {
+            persistReset(window, resolved)
+        }
+        return resolved
+    }
+
+    private func loadPersistedReset(_ window: String) -> PersistedReset? {
+        let defaults = UserDefaults.standard
+        let epoch = defaults.double(forKey: window + Self.resetsAtSuffix)
+        guard epoch > 0 else { return nil }
+        return PersistedReset(resetsAt: Date(timeIntervalSince1970: epoch),
+                              isEstimated: defaults.bool(forKey: window + Self.estimatedSuffix))
+    }
+
+    private func persistReset(_ window: String, _ reset: PersistedReset?) {
+        let defaults = UserDefaults.standard
+        guard let reset else {
+            defaults.removeObject(forKey: window + Self.resetsAtSuffix)
+            defaults.removeObject(forKey: window + Self.estimatedSuffix)
+            return
+        }
+        defaults.set(reset.resetsAt.timeIntervalSince1970, forKey: window + Self.resetsAtSuffix)
+        defaults.set(reset.isEstimated, forKey: window + Self.estimatedSuffix)
     }
 
     /// Estimate the active five-hour window only when history contains a credible
@@ -345,54 +476,136 @@ final class AgentUsageCollector: @unchecked Sendable {
         return reset > now ? reset : nil
     }
 
-    /// Newest Claude Desktop rate-limit audit entry across local environments.
-    private func latestClaudeRateLimit()
-        -> (type: String?, used: Double?, resets: Date?, timestamp: String)? {
+    /// Rate-limit readings from Claude Desktop's session audits. Desktop 1.34493
+    /// stopped appending these, so on current builds this yields nothing and the
+    /// transcript scan below carries the load; older audit files still parse.
+    private func claudeRateLimitReadings() -> [ClaudeRateLimitReading] {
         let base = home + "/Library/Application Support/Claude/local-agent-mode-sessions"
-        var auditPaths: [String] = []
+        var auditFiles: [SessionFile] = []
         for account in (try? fm.contentsOfDirectory(atPath: base)) ?? [] {
             let accountPath = base + "/" + account
             for profile in (try? fm.contentsOfDirectory(atPath: accountPath)) ?? [] {
                 let profilePath = accountPath + "/" + profile
                 for environment in (try? fm.contentsOfDirectory(atPath: profilePath)) ?? [] {
                     let path = profilePath + "/" + environment + "/audit.jsonl"
-                    if fm.fileExists(atPath: path) { auditPaths.append(path) }
+                    if let file = sessionFile(at: path) { auditFiles.append(file) }
                 }
             }
         }
+        return cachedReadings(for: auditFiles, cache: &claudeAuditCache,
+                              scan: scanClaudeRateLimit)
+    }
 
-        var newest: (type: String?, used: Double?, resets: Date?, timestamp: String)?
-        for path in auditPaths {
-            // Desktop usually emits this event near the audit header, while later
-            // versions may append refreshed events. Inspect a bounded head and tail
-            // instead of rereading an ever-growing audit file in full.
-            let chunks = [
-                tailLines(path: path, maxBytes: 16 * 1024 * 1024),
-                tailLines(path: path, maxBytes: 0, headBytes: 256 * 1024),
-            ]
-            for lines in chunks {
-                for line in lines.reversed() {
-                    guard line.contains("\"rate_limit_info\""),
-                          let obj = parseJSON(line),
-                          let ts = obj["timestamp"] as? String,
-                          let info = obj["rate_limit_info"] as? [String: Any]
-                    else { continue }
-                    if let current = newest, ts <= current.timestamp { break }
-
-                    let type = (info["rateLimitType"] ?? info["rate_limit_type"]) as? String
-                    var used = (info["utilization"] as? NSNumber)?.doubleValue
-                    if let value = used, value <= 1 { used = value * 100 }
-                    var resets: Date?
-                    if var epoch = ((info["resetsAt"] ?? info["resets_at"]) as? NSNumber)?.doubleValue {
-                        if epoch > 10_000_000_000 { epoch /= 1000 }
-                        resets = Date(timeIntervalSince1970: epoch)
-                    }
-                    newest = (type, used, resets, ts)
-                    break
-                }
+    /// Exact reset epochs recovered from rejected requests. Claude records the
+    /// server's authoritative `quotaLimits` block on the assistant entry of a 429,
+    /// which is the only live source left on current Desktop builds — the cost is
+    /// that it only appears once a window has actually been exhausted.
+    ///
+    /// Read by byte offset rather than from a fixed tail: a rejected turn is followed
+    /// by however much work the session does once the window reopens, which on a real
+    /// transcript pushes the record hundreds of KB back within hours. Offsets see each
+    /// appended line exactly once, so depth of history stops mattering after first sight.
+    private func claudeQuotaLimitReadings() -> [ClaudeRateLimitReading] {
+        let root = home + "/.claude/projects"
+        // A reset epoch cannot outlive the longest window, so transcripts untouched
+        // for longer than that can no longer hold an active one.
+        let cutoff = Date().addingTimeInterval(-Self.sevenDayWindow)
+        var files: [SessionFile] = []
+        for projectDir in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+            for file in sessionFiles(in: root + "/" + projectDir, cacheHistorical: false)
+            where file.modificationDate >= cutoff {
+                files.append(file)
             }
         }
-        return newest
+        files.sort { $0.modificationDate > $1.modificationDate }
+        files = Array(files.prefix(Self.quotaLimitScanFileLimit))
+
+        let currentPaths = Set(files.map(\.path))
+        claudeQuotaLimitOffsets = claudeQuotaLimitOffsets.filter { currentPaths.contains($0.key) }
+        for file in files {
+            if claudeQuotaLimitOffsets[file.path] == nil {
+                // First sight: skip the bulk of an existing transcript but reach back far
+                // enough to cover a rejection plus the work that followed it. The seek can
+                // land mid-line; that one truncated line fails to parse and is dropped.
+                claudeQuotaLimitOffsets[file.path] = file.size > Self.quotaLimitInitialScanBytes
+                    ? file.size - Self.quotaLimitInitialScanBytes
+                    : 0
+            }
+            consumeNewLines(path: file.path, size: file.size,
+                            offsets: &claudeQuotaLimitOffsets,
+                            prefilter: "\"quotaLimits\"") { line in
+                self.absorbClaudeQuotaLimitLine(line)
+            }
+        }
+        return Array(claudeQuotaLimitByType.values)
+    }
+
+    /// Keep the newest reading per rate-limit type. The literal also occurs inside
+    /// message text (a transcript that discusses this format); requiring the key at
+    /// the top level of the record rejects those.
+    private func absorbClaudeQuotaLimitLine(_ line: String) {
+        guard let obj = parseJSON(line),
+              let timestamp = obj["timestamp"] as? String,
+              let limits = obj["quotaLimits"] as? [String: Any],
+              var epoch = ((limits["resetsAt"] ?? limits["resets_at"]) as? NSNumber)?.doubleValue
+        else { return }
+        let type = (limits["rateLimitType"] ?? limits["rate_limit_type"]) as? String
+        let key = type ?? ""
+        if let current = claudeQuotaLimitByType[key], timestamp <= current.timestamp { return }
+        if epoch > 10_000_000_000 { epoch /= 1000 }
+        // A rejected request means the window is spent, whatever the last local
+        // utilization sample happened to say.
+        let used: Double? = (limits["status"] as? String) == "rejected" ? 100 : nil
+        claudeQuotaLimitByType[key] = (type, used, Date(timeIntervalSince1970: epoch), timestamp)
+    }
+
+    /// Re-scan only the files whose size or mtime moved, then flatten the cache.
+    private func cachedReadings(for files: [SessionFile],
+                                cache: inout [String: CachedClaudeReadings],
+                                scan: (String) -> [ClaudeRateLimitReading])
+        -> [ClaudeRateLimitReading] {
+        let currentPaths = Set(files.map(\.path))
+        cache = cache.filter { currentPaths.contains($0.key) }
+        for file in files {
+            if cache[file.path]?.stamp == file.stamp { continue }
+            cache[file.path] = CachedClaudeReadings(stamp: file.stamp,
+                                                    readings: scan(file.path))
+        }
+        return cache.values.flatMap(\.readings)
+    }
+
+    private func scanClaudeRateLimit(path: String) -> [ClaudeRateLimitReading] {
+        // Desktop usually emits the event near the audit header; newer versions append
+        // refreshed events. A 256 KB head + tail covers both without 16 MB reads.
+        let chunks = [
+            tailLines(path: path, maxBytes: 256 * 1024),
+            tailLines(path: path, maxBytes: 0, headBytes: 256 * 1024),
+        ]
+        // Keyed by rate-limit type: one file can carry both windows, and keeping only
+        // the newest entry overall would hide the other one.
+        var newestByType: [String: ClaudeRateLimitReading] = [:]
+        for lines in chunks {
+            for line in lines.reversed() {
+                guard hasLiteral(line, "\"rate_limit_info\""),
+                      let obj = parseJSON(line),
+                      let timestamp = obj["timestamp"] as? String,
+                      let info = obj["rate_limit_info"] as? [String: Any]
+                else { continue }
+                let type = (info["rateLimitType"] ?? info["rate_limit_type"]) as? String
+                if let current = newestByType[type ?? ""], timestamp <= current.timestamp {
+                    continue
+                }
+                var used = (info["utilization"] as? NSNumber)?.doubleValue
+                if let value = used, value <= 1 { used = value * 100 }
+                var resets: Date?
+                if var epoch = ((info["resetsAt"] ?? info["resets_at"]) as? NSNumber)?.doubleValue {
+                    if epoch > 10_000_000_000 { epoch /= 1000 }
+                    resets = Date(timeIntervalSince1970: epoch)
+                }
+                newestByType[type ?? ""] = (type, used, resets, timestamp)
+            }
+        }
+        return Array(newestByType.values)
     }
 
     /// From the tail of the most recent session: project, the last thing Claude SAID
@@ -412,8 +625,8 @@ final class AgentUsageCollector: @unchecked Sendable {
         var crossedUserTurn = false   // scanned past a real user message → older todos are stale
         var step: (Int, Int, String)?
         for line in tailLines(path: path, maxBytes: 256 * 1024).reversed() {
-            let isAssistant = line.contains("\"type\":\"assistant\"")
-            let isUser = line.contains("\"type\":\"user\"")
+            let isAssistant = hasLiteral(line, "\"type\":\"assistant\"")
+            let isUser = hasLiteral(line, "\"type\":\"user\"")
             guard isAssistant || isUser, let obj = parseJSON(line) else { continue }
             // Subagent side chains don't reflect the main conversation state
             if obj["isSidechain"] as? Bool == true { continue }
@@ -513,12 +726,10 @@ final class AgentUsageCollector: @unchecked Sendable {
         // plus older days only to locate the most recent session for the
         // activity/quota display when nothing has run today.
         let todayStart = Calendar.current.startOfDay(for: Date())
-        let df = DateFormatter()
-        df.dateFormat = "yyyy/MM/dd"
-        var dirs: [String] = []
+        var dirs: [(path: String, cacheHistorical: Bool)] = []
         for back in 0..<14 {
             if let d = Calendar.current.date(byAdding: .day, value: -back, to: Date()) {
-                dirs.append(root + "/" + df.string(from: d))
+                dirs.append((root + "/" + sessionDayFormatter.string(from: d), back >= 2))
             }
         }
 
@@ -526,19 +737,16 @@ final class AgentUsageCollector: @unchecked Sendable {
         var latestMtime = Date.distantPast
 
         for dir in dirs {
-            for file in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] {
-                guard file.hasSuffix(".jsonl") else { continue }
-                let path = dir + "/" + file
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let mtime = attrs[.modificationDate] as? Date
-                else { continue }
+            for file in sessionFiles(in: dir.path, cacheHistorical: dir.cacheHistorical) {
                 // Latest session overall — drives activity/quota display
-                if mtime > latestMtime { latestMtime = mtime; latestPath = path }
+                if file.modificationDate > latestMtime {
+                    latestMtime = file.modificationDate
+                    latestPath = file.path
+                }
 
                 // Token counting is scoped to today only
-                guard mtime >= todayStart else { continue }
-                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-                consumeNewLines(path: path, size: size, offsets: &codexOffsets,
+                guard file.modificationDate >= todayStart else { continue }
+                consumeNewLines(path: file.path, size: file.size, offsets: &codexOffsets,
                                 prefilter: "\"token_count\"") { line in
                     self.accumulateCodexLine(line)
                 }
@@ -553,9 +761,7 @@ final class AgentUsageCollector: @unchecked Sendable {
         var project: String?
         var activity: String?
         var secondsAgo: Int?
-        let quotaUsed = codexQuotaCache?.used
-        let quotaResets = codexQuotaCache?.resets
-        let quotaWindow = codexQuotaCache?.window
+        let quotas = codexQuotaCache
         var attention = false
         var working = false
         var step: (current: Int, total: Int, text: String)?
@@ -563,8 +769,9 @@ final class AgentUsageCollector: @unchecked Sendable {
             let ago = max(0, Int(Date().timeIntervalSince(latestMtime)))
             secondsAgo = ago
             let rawWaiting: Bool
-            (project, activity, rawWaiting) = codexActivity(path: path)
-            step = codexPlan(path: path)
+            let sessionTail = tailLines(path: path, maxBytes: 512 * 1024)
+            (project, activity, rawWaiting) = codexActivity(path: path, tailLines: sessionTail)
+            step = codexPlan(lines: sessionTail)
             // Actively running = not waiting on the user AND the file just changed
             working = !rawWaiting && ago < 90
             attention = rawWaiting && ago < 900
@@ -579,8 +786,7 @@ final class AgentUsageCollector: @unchecked Sendable {
                           todayOutputTokens: codexOutput,
                           secondsSinceActive: secondsAgo,
                           project: project, activity: activity,
-                          quotaUsedPercent: quotaUsed, quotaResetsAt: quotaResets,
-                          quotaWindowLabel: quotaWindow,
+                          quotas: quotas,
                           needsAttention: attention, isWorking: working,
                           stepCurrent: step?.current, stepTotal: step?.total,
                           stepText: step?.text)
@@ -591,10 +797,10 @@ final class AgentUsageCollector: @unchecked Sendable {
     /// once the planned task finished and a new turn began without its own plan, the
     /// stale plan must not linger on screen. Scanning newest-first, whichever comes
     /// first — a plan update or a task completion — decides.
-    private func codexPlan(path: String) -> (current: Int, total: Int, text: String)? {
-        for line in tailLines(path: path, maxBytes: 512 * 1024).reversed() {
-            let maybePlan = line.contains("update_plan")
-            let maybeDone = line.contains("\"task_complete\"")
+    private func codexPlan(lines: [String]) -> (current: Int, total: Int, text: String)? {
+        for line in lines.reversed() {
+            let maybePlan = hasLiteral(line, "update_plan")
+            let maybeDone = hasLiteral(line, "\"task_complete\"")
             guard maybePlan || maybeDone,
                   let obj = parseJSON(line),
                   let payload = obj["payload"] as? [String: Any]
@@ -606,7 +812,7 @@ final class AgentUsageCollector: @unchecked Sendable {
             // Two plan encodings across Codex versions:
             //  · custom_tool_call → `input`: JS source `tools.update_plan({plan:[…]})`
             //  · function_call    → `arguments`: JSON `{"plan":[…]}` (name == update_plan)
-            if let input = payload["input"] as? String, input.contains("update_plan") {
+            if let input = payload["input"] as? String, hasLiteral(input, "update_plan") {
                 return parseCodexPlan(input)
             }
             if payload["name"] as? String == "update_plan",
@@ -664,48 +870,88 @@ final class AgentUsageCollector: @unchecked Sendable {
     /// Find the newest standard quota reading across recent session files.
     private func updateCodexQuotaFromTranscripts() {
         let root = home + "/.codex/sessions"
-        let df = DateFormatter(); df.dateFormat = "yyyy/MM/dd"
         let cutoff = Date().addingTimeInterval(-3 * 86400)
+        var recentFiles: [SessionFile] = []
         for back in 0..<4 {
             guard let day = Calendar.current.date(byAdding: .day, value: -back, to: Date())
             else { continue }
-            let dir = root + "/" + df.string(from: day)
-            for file in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] {
-                guard file.hasSuffix(".jsonl") else { continue }
-                let path = dir + "/" + file
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let mtime = attrs[.modificationDate] as? Date, mtime >= cutoff
-                else { continue }
-                // First (newest) populated reading in this file; update global if newer
-                for line in tailLines(path: path, maxBytes: 16 * 1024 * 1024).reversed() {
-                    guard line.contains("used_percent"),
-                          let obj = parseJSON(line),
-                          let ts = obj["timestamp"] as? String,
-                          let payload = obj["payload"] as? [String: Any],
-                          let limits = payload["rate_limits"] as? [String: Any],
-                          let primary = limits["primary"] as? [String: Any],
-                          let used = (primary["used_percent"] as? NSNumber)?.doubleValue
-                    else { continue }
-                    // Codex can emit independent experimental limit pools in the same
-                    // transcript. They must not override the account's standard quota.
-                    // Accept a missing ID for compatibility with older session logs.
-                    if let limitID = limits["limit_id"] as? String,
-                       limitID != "codex" {
-                        continue
-                    }
-                    if ts > codexQuotaTS {
-                        codexQuotaTS = ts
-                        var resets: Date?
-                        if let r = (primary["resets_at"] as? NSNumber)?.doubleValue {
-                            resets = Date(timeIntervalSince1970: r)
-                        }
-                        let minutes = (primary["window_minutes"] as? NSNumber)?.intValue
-                        codexQuotaCache = (used, resets, quotaWindowLabel(minutes: minutes))
-                    }
-                    break  // done with this file; other files may still be newer
-                }
+            let dir = root + "/" + sessionDayFormatter.string(from: day)
+            recentFiles.append(contentsOf: sessionFiles(in: dir, cacheHistorical: back >= 2)
+                .filter { $0.modificationDate >= cutoff })
+        }
+
+        let currentPaths = Set(recentFiles.map(\.path))
+        codexQuotaFileCache = codexQuotaFileCache.filter { currentPaths.contains($0.key) }
+        for file in recentFiles {
+            if codexQuotaFileCache[file.path]?.stamp == file.stamp { continue }
+            codexQuotaFileCache[file.path] = CachedCodexQuotaFile(
+                stamp: file.stamp,
+                reading: scanCodexQuota(path: file.path))
+        }
+
+        var newest: CodexQuotaReading?
+        for cached in codexQuotaFileCache.values {
+            guard let reading = cached.reading else { continue }
+            if newest == nil || reading.timestamp > newest!.timestamp {
+                newest = reading
             }
         }
+        if let newest, newest.timestamp > codexQuotaTS {
+            codexQuotaTS = newest.timestamp
+            codexQuotaCache = newest.quotas
+        }
+    }
+
+    private func scanCodexQuota(path: String) -> CodexQuotaReading? {
+        for line in tailLines(path: path, maxBytes: 256 * 1024).reversed() {
+            guard hasLiteral(line, "used_percent"),
+                  let obj = parseJSON(line),
+                  let timestamp = obj["timestamp"] as? String,
+                  let payload = obj["payload"] as? [String: Any],
+                  let limits = payload["rate_limits"] as? [String: Any]
+            else { continue }
+
+            // Codex can emit independent experimental limit pools in the same
+            // transcript. They must not override the account's standard quota.
+            if let limitID = limits["limit_id"] as? String, limitID != "codex" {
+                continue
+            }
+
+            var fiveHour: AgentQuota?
+            var sevenDay: AgentQuota?
+            for key in ["primary", "secondary"] {
+                guard let window = limits[key] as? [String: Any],
+                      let used = (window["used_percent"] as? NSNumber)?.doubleValue,
+                      let minutes = (window["window_minutes"] as? NSNumber)?.intValue
+                else { continue }
+
+                var resets: Date?
+                if let value = (window["resets_at"] as? NSNumber)?.doubleValue {
+                    resets = Date(timeIntervalSince1970: value)
+                }
+                let quota = AgentQuota(
+                    usedPercent: min(max(used, 0), 100),
+                    resetsAt: resets,
+                    resetIsEstimated: false,
+                    windowLabel: quotaWindowLabel(minutes: minutes))
+                if minutes <= 5 * 60 {
+                    fiveHour = quota
+                } else if minutes >= 7 * 24 * 60 {
+                    sevenDay = quota
+                }
+            }
+
+            guard fiveHour != nil || sevenDay != nil else { continue }
+            return CodexQuotaReading(
+                quotas: [
+                    fiveHour ?? AgentQuota(usedPercent: nil, resetsAt: nil,
+                                             resetIsEstimated: false, windowLabel: "5小时"),
+                    sevenDay ?? AgentQuota(usedPercent: nil, resetsAt: nil,
+                                           resetIsEstimated: false, windowLabel: "7天"),
+                ],
+                timestamp: timestamp)
+        }
+        return nil
     }
 
     private func quotaWindowLabel(minutes: Int?) -> String {
@@ -736,7 +982,7 @@ final class AgentUsageCollector: @unchecked Sendable {
     /// (project, activity, needsAttention). Attention: the last significant event is
     /// task_complete (done) or an approval request (waiting for the user); a newer
     /// user message or a running tool call cancels it.
-    private func codexActivity(path: String) -> (String?, String?, Bool) {
+    private func codexActivity(path: String, tailLines sessionTail: [String]) -> (String?, String?, Bool) {
         // cwd lives in the head session_meta line, but that line embeds the full
         // system prompt (tens of KB) so a JSON parse would need the whole line.
         // cwd appears before the prompt, so pull it by substring from a head chunk.
@@ -763,14 +1009,14 @@ final class AgentUsageCollector: @unchecked Sendable {
         var reasoning: String?
         var attention = false
         var stateDetermined = false
-        for line in tailLines(path: path, maxBytes: 256 * 1024).reversed() {
+        for line in sessionTail.reversed() {
             guard let obj = parseJSON(line),
                   let payload = obj["payload"] as? [String: Any],
                   let type = payload["type"] as? String
             else { continue }
 
             if !stateDetermined {
-                if type == "task_complete" || type.contains("approval_request") {
+                if type == "task_complete" || hasLiteral(type, "approval_request") {
                     attention = true; stateDetermined = true
                 } else if workingTypes.contains(type)
                             || (type == "message" && payload["role"] as? String == "user") {
@@ -839,6 +1085,71 @@ final class AgentUsageCollector: @unchecked Sendable {
 
     // MARK: - File Helpers
 
+    /// Enumerate JSONL files with URL resource prefetching. This avoids constructing
+    /// an attributes dictionary (including xattrs) for every file on every tick.
+    private func sessionFiles(in directory: String, cacheHistorical: Bool) -> [SessionFile] {
+        if cacheHistorical, let cached = historicalCodexFiles[directory] {
+            return cached
+        }
+
+        let directoryURL = URL(fileURLWithPath: directory, isDirectory: true)
+        let urls = (try? fm.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: Array(fileResourceKeys),
+            options: [.skipsHiddenFiles])) ?? []
+        let files = urls.compactMap { url -> SessionFile? in
+            guard url.pathExtension == "jsonl",
+                  let values = try? url.resourceValues(forKeys: fileResourceKeys),
+                  values.isRegularFile == true,
+                  let modificationDate = values.contentModificationDate
+            else { return nil }
+            return SessionFile(
+                path: url.path,
+                modificationDate: modificationDate,
+                size: UInt64(max(0, values.fileSize ?? 0)))
+        }
+        if cacheHistorical {
+            historicalCodexFiles[directory] = files
+        }
+        return files
+    }
+
+    private func sessionFile(at path: String) -> SessionFile? {
+        let url = URL(fileURLWithPath: path)
+        guard let values = try? url.resourceValues(forKeys: fileResourceKeys),
+              values.isRegularFile == true,
+              let modificationDate = values.contentModificationDate
+        else { return nil }
+        return SessionFile(
+            path: path,
+            modificationDate: modificationDate,
+            size: UInt64(max(0, values.fileSize ?? 0)))
+    }
+
+    private func hasLiteral(_ string: String, _ literal: String) -> Bool {
+        string.range(of: literal, options: .literal) != nil
+    }
+
+    private func containsBytes<C: Collection>(_ bytes: C, pattern: [UInt8]) -> Bool
+        where C.Element == UInt8 {
+        guard !pattern.isEmpty else { return true }
+        guard bytes.count >= pattern.count else { return false }
+
+        for start in bytes.indices {
+            var index = start
+            var matched = true
+            for expected in pattern {
+                guard index != bytes.endIndex, bytes[index] == expected else {
+                    matched = false
+                    break
+                }
+                bytes.formIndex(after: &index)
+            }
+            if matched { return true }
+        }
+        return false
+    }
+
     /// Feed complete NEW lines (since the stored offset) matching `prefilter`
     /// to `handler`, then advance the offset past the last complete line.
     private func consumeNewLines(path: String, size: UInt64,
@@ -857,9 +1168,10 @@ final class AgentUsageCollector: @unchecked Sendable {
         offsets[path] = offset + UInt64(lastNL) + 1
 
         let complete = data[data.startIndex...lastNL]
+        let prefilterBytes = Array(prefilter.utf8)
         for chunk in complete.split(separator: UInt8(ascii: "\n")) {
-            guard let line = String(data: Data(chunk), encoding: .utf8),
-                  line.contains(prefilter)
+            guard containsBytes(chunk, pattern: prefilterBytes),
+                  let line = String(data: Data(chunk), encoding: .utf8)
             else { continue }
             handler(line)
         }

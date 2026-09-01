@@ -58,6 +58,9 @@ private let fbl192ByPM: [Int: (Int, Int)] = [
 
 enum LYProtocol {
 
+    private static let frameBufferLock = NSLock()
+    nonisolated(unsafe) private static var frameBuffer = Data()
+
     /// Perform USB handshake with the LCD device.
     /// Sends 2048-byte init packet, reads 512-byte response, extracts device info.
     static func handshake(device: USBDevice) throws -> DeviceInfo {
@@ -146,55 +149,15 @@ enum LYProtocol {
 
     /// Send one JPEG frame using LY chunked bulk protocol.
     static func sendFrame(device: USBDevice, jpegData: Data) throws {
+        frameBufferLock.lock()
+        defer { frameBufferLock.unlock() }
+
         let pid = device.pid
         let chunkCmd: UInt8 = (pid == 0x5408) ? 0x01 : 0x02
 
         let totalSize = jpegData.count
         let numChunks = totalSize / chunkDataSize + 1
         let lastChunkData = totalSize % chunkDataSize
-
-        // Build all 512-byte chunks
-        var chunks = Data(count: numChunks * chunkSize)
-
-        for i in 0..<numChunks {
-            let offset = i * chunkSize
-            let isLast = (i == numChunks - 1)
-            let dataLen = isLast ? lastChunkData : chunkDataSize
-
-            // 16-byte header (little-endian)
-            chunks[offset] = 0x01
-            chunks[offset + 1] = 0xFF
-
-            // Total payload size (LE32) at offset+2
-            chunks.withUnsafeMutableBytes { ptr in
-                ptr.storeBytes(of: UInt32(totalSize).littleEndian,
-                               toByteOffset: offset + 2, as: UInt32.self)
-                // This chunk's data length (LE16) at offset+6
-                ptr.storeBytes(of: UInt16(dataLen).littleEndian,
-                               toByteOffset: offset + 6, as: UInt16.self)
-            }
-
-            chunks[offset + 8] = chunkCmd
-
-            // Total chunk count (LE16) at offset+9, chunk index (LE16) at offset+11
-            chunks.withUnsafeMutableBytes { ptr in
-                ptr.storeBytes(of: UInt16(numChunks).littleEndian,
-                               toByteOffset: offset + 9, as: UInt16.self)
-                ptr.storeBytes(of: UInt16(i).littleEndian,
-                               toByteOffset: offset + 11, as: UInt16.self)
-            }
-
-            // Padding bytes [13:16] are already zero
-
-            // Copy payload
-            let srcOffset = i * chunkDataSize
-            let destOffset = offset + chunkHeaderSize
-            if dataLen > 0 {
-                chunks.replaceSubrange(
-                    destOffset..<destOffset + dataLen,
-                    with: jpegData[srcOffset..<srcOffset + dataLen])
-            }
-        }
 
         // Pad chunk count to multiple of 4 (LY type) or 1 (LY1)
         let padMultiple = (pid == 0x5408) ? 4 : 1
@@ -205,10 +168,43 @@ enum LYProtocol {
         }
         let totalBytes = paddedChunks * chunkSize
 
-        // Extend with zeros if needed
-        var sendBuf = chunks
-        if totalBytes > chunks.count {
-            sendBuf.append(Data(count: totalBytes - chunks.count))
+        // Grow one process-lifetime buffer as needed, then rebuild the frame in place.
+        // This avoids separate chunks/send buffers and per-write Data(slice) copies.
+        if frameBuffer.count < totalBytes {
+            frameBuffer.append(Data(count: totalBytes - frameBuffer.count))
+        } else if frameBuffer.count > totalBytes {
+            frameBuffer.removeSubrange(totalBytes..<frameBuffer.count)
+        }
+        frameBuffer.resetBytes(in: 0..<totalBytes)
+
+        frameBuffer.withUnsafeMutableBytes { destination in
+            jpegData.withUnsafeBytes { source in
+                for i in 0..<numChunks {
+                    let offset = i * chunkSize
+                    let isLast = (i == numChunks - 1)
+                    let dataLen = isLast ? lastChunkData : chunkDataSize
+
+                    destination[offset] = 0x01
+                    destination[offset + 1] = 0xFF
+                    destination.storeBytes(of: UInt32(totalSize).littleEndian,
+                                           toByteOffset: offset + 2, as: UInt32.self)
+                    destination.storeBytes(of: UInt16(dataLen).littleEndian,
+                                           toByteOffset: offset + 6, as: UInt16.self)
+                    destination[offset + 8] = chunkCmd
+                    destination.storeBytes(of: UInt16(numChunks).littleEndian,
+                                           toByteOffset: offset + 9, as: UInt16.self)
+                    destination.storeBytes(of: UInt16(i).littleEndian,
+                                           toByteOffset: offset + 11, as: UInt16.self)
+
+                    if dataLen > 0,
+                       let destinationBase = destination.baseAddress,
+                       let sourceBase = source.baseAddress {
+                        destinationBase.advanced(by: offset + chunkHeaderSize).copyMemory(
+                            from: sourceBase.advanced(by: i * chunkDataSize),
+                            byteCount: dataLen)
+                    }
+                }
+            }
         }
 
         // Send in 4096-byte batches
@@ -221,9 +217,8 @@ enum LYProtocol {
             } else {
                 writeSize = (pid == 0x5408) ? min(2048, remaining) : remaining
             }
-            let slice = sendBuf[pos..<pos + writeSize]
-            _ = try device.bulkWrite(Data(slice), timeout: 5000)
-            pos += usbWriteSize
+            _ = try device.bulkWrite(frameBuffer, range: pos..<pos + writeSize, timeout: 5000)
+            pos += writeSize
         }
 
         // Read ACK

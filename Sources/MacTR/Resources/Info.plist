@@ -20,13 +20,5 @@
 	<false/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>SUEnableAutomaticChecks</key>
-	<true/>
-	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/beret21/MacTR/main/appcast.xml</string>
-	<key>SUPublicEDKey</key>
-	<string>cFBwTLEG3a+RMA0SIGpWpITuHaaeg7qPKeZXnOh5R64=</string>
-	<key>SUScheduledCheckInterval</key>
-	<integer>86400</integer>
 </dict>
 </plist>

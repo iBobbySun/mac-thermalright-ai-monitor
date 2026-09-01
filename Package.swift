@@ -6,9 +6,7 @@ let package = Package(
     platforms: [
         .macOS("15.0")
     ],
-    dependencies: [
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
-    ],
+    dependencies: [],
     targets: [
         .systemLibrary(
             name: "CLibUSB",
@@ -29,7 +27,6 @@ let package = Package(
             dependencies: [
                 "CLibUSB",
                 "CThermalSensor",
-                .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Sources/MacTR",
             exclude: ["Resources"],

@@ -109,8 +109,8 @@ using `--demo` / `--benchmark`.
 
 ## How agent data is read
 
-MacTR never talks to any network or API. It only reads local session transcripts that the
-CLIs already write to disk:
+MacTR never talks to any network or API. This fork removes the Sparkle auto-updater and only
+reads local session transcripts that the CLIs already write to disk:
 
 | Agent | Source | What's parsed |
 |---|---|---|
