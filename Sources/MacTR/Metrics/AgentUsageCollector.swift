@@ -4,7 +4,7 @@
 // agent's latest activity:
 //   Claude: ~/.claude/projects/<proj>/<session>.jsonl — per-message "usage"
 //   Codex:  ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — "token_count" events
-//   Quota:  latest standard "codex" rate-limit event in local session JSONL
+//   Quota:  Claude Desktop usage history/audit + latest standard Codex rate-limit event
 //
 // Files are read incrementally (per-file byte offsets) so the steady-state
 // cost per tick is a stat() per candidate file plus any appended bytes —
@@ -21,8 +21,10 @@ struct AgentUsage: Sendable {
     let secondsSinceActive: Int?    // nil = no session today
     let project: String?            // cwd basename of most recent session
     let activity: String?           // latest tool call / message summary
-    let quotaUsedPercent: Double?   // rate-limit window usage (Codex only for now)
+    let quotaUsedPercent: Double?   // selected rate-limit window usage, 0...100
     let quotaResetsAt: Date?
+    let quotaResetIsEstimated: Bool // true when inferred from local window samples
+    let quotaWindowLabel: String?   // e.g. "5小时" / "7天"
     let needsAttention: Bool        // turn finished / waiting for user — flash the column
     let isWorking: Bool             // actively running a turn — slow breathing background
     let stepCurrent: Int?           // active plan step (1-based); nil = no plan
@@ -33,6 +35,8 @@ struct AgentUsage: Sendable {
     init(available: Bool, todayInputTokens: UInt64, todayOutputTokens: UInt64,
          secondsSinceActive: Int?, project: String?, activity: String?,
          quotaUsedPercent: Double? = nil, quotaResetsAt: Date? = nil,
+         quotaResetIsEstimated: Bool = false,
+         quotaWindowLabel: String? = nil,
          needsAttention: Bool = false, isWorking: Bool = false,
          stepCurrent: Int? = nil, stepTotal: Int? = nil, stepText: String? = nil) {
         self.available = available
@@ -43,6 +47,8 @@ struct AgentUsage: Sendable {
         self.activity = activity
         self.quotaUsedPercent = quotaUsedPercent
         self.quotaResetsAt = quotaResetsAt
+        self.quotaResetIsEstimated = quotaResetIsEstimated
+        self.quotaWindowLabel = quotaWindowLabel
         self.needsAttention = needsAttention
         self.isWorking = isWorking
         self.stepCurrent = stepCurrent
@@ -82,10 +88,18 @@ final class AgentUsageCollector: @unchecked Sendable {
     private var codexPrevAttention = false
     private var codexAttentionSince: Date?
 
+    // Claude Desktop writes small, local-only usage samples plus the active limit's
+    // reset time. Cache the selected (representative) window so the high-frequency
+    // metrics loop does not repeatedly traverse Desktop session directories.
+    private var claudeQuotaCache: (used: Double, resets: Date?, resetIsEstimated: Bool,
+                                   window: String)?
+    private var claudeQuotaLastRefresh: Date?
+    private let claudeQuotaRefreshInterval: TimeInterval = 5 * 60
+
     // Last-known Codex quota (account-global). The full rate-limit block appears only
     // occasionally and the newest reading may be in a different file than the active
     // one, so we track the newest-by-timestamp across recent files and cache it.
-    private var codexQuotaCache: (used: Double, resets: Date?)?
+    private var codexQuotaCache: (used: Double, resets: Date?, window: String)?
     private var codexQuotaTS = ""            // newest reading's timestamp seen so far
     private var codexQuotaLastRefresh: Date?
     private let codexQuotaRefreshInterval: TimeInterval = 5 * 60
@@ -116,10 +130,15 @@ final class AgentUsageCollector: @unchecked Sendable {
     // MARK: - Claude
 
     private func collectClaude() -> AgentUsage {
+        updateClaudeQuota()
+        let quota = claudeQuotaCache
         let root = home + "/.claude/projects"
         guard fm.fileExists(atPath: root) else {
             return AgentUsage(available: false, todayInputTokens: 0, todayOutputTokens: 0,
-                              secondsSinceActive: nil, project: nil, activity: nil)
+                              secondsSinceActive: nil, project: nil, activity: nil,
+                              quotaUsedPercent: quota?.used, quotaResetsAt: quota?.resets,
+                              quotaResetIsEstimated: quota?.resetIsEstimated ?? false,
+                              quotaWindowLabel: quota?.window)
         }
 
         let todayStart = Calendar.current.startOfDay(for: Date())
@@ -177,6 +196,9 @@ final class AgentUsageCollector: @unchecked Sendable {
                           todayOutputTokens: claudeOutput,
                           secondsSinceActive: secondsAgo,
                           project: project, activity: activity,
+                          quotaUsedPercent: quota?.used, quotaResetsAt: quota?.resets,
+                          quotaResetIsEstimated: quota?.resetIsEstimated ?? false,
+                          quotaWindowLabel: quota?.window,
                           needsAttention: attention, isWorking: working,
                           stepCurrent: step?.current, stepTotal: step?.total,
                           stepText: step?.text)
@@ -197,6 +219,180 @@ final class AgentUsageCollector: @unchecked Sendable {
             + uint(usage["cache_creation_input_tokens"])
             + uint(usage["cache_read_input_tokens"])
         claudeOutput += uint(usage["output_tokens"])
+    }
+
+    /// Claude Desktop persists plan utilization locally in `plan-usage-history.json`.
+    /// Its session audit supplies the representative rate-limit type and reset epoch.
+    /// Both reads are local and credential-free; no API request or subprocess is used.
+    private func updateClaudeQuota() {
+        if let last = claudeQuotaLastRefresh,
+           Date().timeIntervalSince(last) < claudeQuotaRefreshInterval {
+            return
+        }
+        claudeQuotaLastRefresh = Date()
+
+        let historyPath = home + "/Library/Application Support/Claude/plan-usage-history.json"
+        guard let data = fm.contents(atPath: historyPath),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let samples = root["samples"] as? [[String: Any]]
+        else { return }
+
+        var historySamples: [(date: Date, fiveHour: Double?, sevenDay: Double?)] = []
+        for sample in samples {
+            guard var epoch = (sample["t"] as? NSNumber)?.doubleValue,
+                  let usage = sample["u"] as? [String: Any], !usage.isEmpty
+            else { continue }
+            if epoch > 10_000_000_000 { epoch /= 1000 }
+            historySamples.append((
+                Date(timeIntervalSince1970: epoch),
+                (usage["fh"] as? NSNumber)?.doubleValue,
+                (usage["sd"] as? NSNumber)?.doubleValue
+            ))
+        }
+        historySamples.sort { $0.date < $1.date }
+        guard let latest = historySamples.last else { return }
+
+        let fiveHour = latest.fiveHour
+        let sevenDay = latest.sevenDay
+        let rate = latestClaudeRateLimit()
+        let now = Date()
+        // Claude Desktop 1.34493 stopped appending fresh rate-limit audit events.
+        // An expired audit record remains useful history, but must not dictate the
+        // active quota window or be shown as today's reset time.
+        let activeRate = rate.flatMap { reading -> (type: String?, used: Double?,
+                                                    resets: Date?, timestamp: String)? in
+            guard let reset = reading.resets, reset > now else { return nil }
+            return reading
+        }
+
+        let used: Double?
+        let window: String
+        switch activeRate?.type {
+        case "five_hour":
+            used = activeRate?.used ?? fiveHour
+            window = "5小时"
+        case "seven_day", "seven_day_opus", "seven_day_sonnet":
+            used = activeRate?.used ?? sevenDay
+            window = "7天"
+        default:
+            // If the audit has not emitted a representative claim yet, show the
+            // tighter of the two locally sampled windows rather than guessing.
+            if let fh = fiveHour, fh >= (sevenDay ?? -1) {
+                used = fh; window = "5小时"
+            } else {
+                used = sevenDay; window = "7天"
+            }
+        }
+        guard let used else { return }
+        let exactReset = activeRate?.resets
+        let estimatedReset = exactReset == nil && window == "5小时"
+            ? estimatedFiveHourReset(
+                samples: historySamples.map { ($0.date, $0.fiveHour) }, now: now
+            )
+            : nil
+        claudeQuotaCache = (min(max(used, 0), 100), exactReset ?? estimatedReset,
+                            exactReset == nil && estimatedReset != nil, window)
+    }
+
+    /// Estimate the active five-hour window only when history contains a credible
+    /// boundary: a drop/reset followed by use, or a zero sample immediately before
+    /// the first positive sample. Claude reports reset boundaries on ten-minute
+    /// marks, so round the bracket midpoint before adding the five-hour window.
+    private func estimatedFiveHourReset(
+        samples: [(date: Date, used: Double?)], now: Date
+    ) -> Date? {
+        let values = samples.compactMap { sample -> (date: Date, used: Double)? in
+            guard let used = sample.used else { return nil }
+            return (sample.date, used)
+        }.sorted { $0.date < $1.date }
+        guard let latest = values.last,
+              latest.used > 0,
+              now.timeIntervalSince(latest.date) >= -5 * 60,
+              now.timeIntervalSince(latest.date) <= 30 * 60
+        else { return nil }
+
+        var segmentStart = 0
+        if values.count > 1 {
+            for index in 1..<values.count {
+                let previous = values[index - 1].used
+                let current = values[index].used
+                if (current <= 0 && previous > 0) || previous - current >= 10 {
+                    segmentStart = index
+                }
+            }
+        }
+
+        guard let firstPositive = values[segmentStart...].firstIndex(where: { $0.used > 0 })
+        else { return nil }
+
+        let estimatedStart: Date
+        if firstPositive > segmentStart,
+           values[firstPositive - 1].used <= 0,
+           values[firstPositive].date.timeIntervalSince(values[firstPositive - 1].date) <= 30 * 60 {
+            let lower = values[firstPositive - 1].date
+            let upper = values[firstPositive].date
+            estimatedStart = lower.addingTimeInterval(upper.timeIntervalSince(lower) / 2)
+        } else if segmentStart > 0 {
+            estimatedStart = values[firstPositive].date
+        } else {
+            return nil
+        }
+
+        let tenMinutes: TimeInterval = 10 * 60
+        let roundedStart = Date(timeIntervalSince1970:
+            (estimatedStart.timeIntervalSince1970 / tenMinutes).rounded() * tenMinutes)
+        let reset = roundedStart.addingTimeInterval(5 * 60 * 60)
+        return reset > now ? reset : nil
+    }
+
+    /// Newest Claude Desktop rate-limit audit entry across local environments.
+    private func latestClaudeRateLimit()
+        -> (type: String?, used: Double?, resets: Date?, timestamp: String)? {
+        let base = home + "/Library/Application Support/Claude/local-agent-mode-sessions"
+        var auditPaths: [String] = []
+        for account in (try? fm.contentsOfDirectory(atPath: base)) ?? [] {
+            let accountPath = base + "/" + account
+            for profile in (try? fm.contentsOfDirectory(atPath: accountPath)) ?? [] {
+                let profilePath = accountPath + "/" + profile
+                for environment in (try? fm.contentsOfDirectory(atPath: profilePath)) ?? [] {
+                    let path = profilePath + "/" + environment + "/audit.jsonl"
+                    if fm.fileExists(atPath: path) { auditPaths.append(path) }
+                }
+            }
+        }
+
+        var newest: (type: String?, used: Double?, resets: Date?, timestamp: String)?
+        for path in auditPaths {
+            // Desktop usually emits this event near the audit header, while later
+            // versions may append refreshed events. Inspect a bounded head and tail
+            // instead of rereading an ever-growing audit file in full.
+            let chunks = [
+                tailLines(path: path, maxBytes: 16 * 1024 * 1024),
+                tailLines(path: path, maxBytes: 0, headBytes: 256 * 1024),
+            ]
+            for lines in chunks {
+                for line in lines.reversed() {
+                    guard line.contains("\"rate_limit_info\""),
+                          let obj = parseJSON(line),
+                          let ts = obj["timestamp"] as? String,
+                          let info = obj["rate_limit_info"] as? [String: Any]
+                    else { continue }
+                    if let current = newest, ts <= current.timestamp { break }
+
+                    let type = (info["rateLimitType"] ?? info["rate_limit_type"]) as? String
+                    var used = (info["utilization"] as? NSNumber)?.doubleValue
+                    if let value = used, value <= 1 { used = value * 100 }
+                    var resets: Date?
+                    if var epoch = ((info["resetsAt"] ?? info["resets_at"]) as? NSNumber)?.doubleValue {
+                        if epoch > 10_000_000_000 { epoch /= 1000 }
+                        resets = Date(timeIntervalSince1970: epoch)
+                    }
+                    newest = (type, used, resets, ts)
+                    break
+                }
+            }
+        }
+        return newest
     }
 
     /// From the tail of the most recent session: project, the last thing Claude SAID
@@ -359,6 +555,7 @@ final class AgentUsageCollector: @unchecked Sendable {
         var secondsAgo: Int?
         let quotaUsed = codexQuotaCache?.used
         let quotaResets = codexQuotaCache?.resets
+        let quotaWindow = codexQuotaCache?.window
         var attention = false
         var working = false
         var step: (current: Int, total: Int, text: String)?
@@ -383,6 +580,7 @@ final class AgentUsageCollector: @unchecked Sendable {
                           secondsSinceActive: secondsAgo,
                           project: project, activity: activity,
                           quotaUsedPercent: quotaUsed, quotaResetsAt: quotaResets,
+                          quotaWindowLabel: quotaWindow,
                           needsAttention: attention, isWorking: working,
                           stepCurrent: step?.current, stepTotal: step?.total,
                           stepText: step?.text)
@@ -501,12 +699,22 @@ final class AgentUsageCollector: @unchecked Sendable {
                         if let r = (primary["resets_at"] as? NSNumber)?.doubleValue {
                             resets = Date(timeIntervalSince1970: r)
                         }
-                        codexQuotaCache = (used, resets)
+                        let minutes = (primary["window_minutes"] as? NSNumber)?.intValue
+                        codexQuotaCache = (used, resets, quotaWindowLabel(minutes: minutes))
                     }
                     break  // done with this file; other files may still be newer
                 }
             }
         }
+    }
+
+    private func quotaWindowLabel(minutes: Int?) -> String {
+        guard let minutes else { return "额度" }
+        if minutes <= 5 * 60 { return "5小时" }
+        if minutes >= 7 * 24 * 60 { return "7天" }
+        if minutes % (24 * 60) == 0 { return "\(minutes / (24 * 60))天" }
+        if minutes % 60 == 0 { return "\(minutes / 60)小时" }
+        return "\(minutes)分钟"
     }
 
     /// Sum per-request deltas (`last_token_usage`), NOT `total_token_usage`:

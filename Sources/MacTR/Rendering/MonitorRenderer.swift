@@ -87,6 +87,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                    project: u.project, activity: u.activity,
                    quotaUsedPercent: u.quotaUsedPercent,
                    quotaResetsAt: u.quotaResetsAt,
+                   quotaResetIsEstimated: u.quotaResetIsEstimated,
+                   quotaWindowLabel: u.quotaWindowLabel,
                    needsAttention: true)
     }
 
@@ -224,6 +226,9 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                                | Collector | 解析消息与待办 |
                                | Renderer | 表格化排版 |
                                """,
+                               quotaUsedPercent: 18,
+                               quotaResetsAt: Date().addingTimeInterval(3 * 3600),
+                               quotaWindowLabel: "5小时",
                                isWorking: true,
                                stepCurrent: 3, stepTotal: 4,
                                stepText: "渲染 Claude 消息表格"),
@@ -242,6 +247,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                               """,
                               quotaUsedPercent: 57,
                               quotaResetsAt: Date().addingTimeInterval(3600 * 24 * 6),
+                              quotaWindowLabel: "7天",
                               isWorking: true,
                               stepCurrent: 4, stepTotal: 6,
                               stepText: "部署到预发环境并跑冒烟测试"))
@@ -653,7 +659,9 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             cy += 16
         }
 
-        let tokenY = y + h - 64
+        // Reserve an explicit quota row at the bottom. The old compact layout only
+        // drew an unlabeled bar, so neither remaining allowance nor reset date was visible.
+        let tokenY = y + h - 90
         renderMessage(ctx, text: usage.activity ?? (usage.available ? "空闲" : "—"),
                       x: innerX, y: cy, w: innerW, bottom: tokenY - 8, accent: accent)
 
@@ -680,13 +688,18 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                       font: ioFont, color: Color.textL)
         }
 
-        if let used = usage.quotaUsedPercent {
-            let remaining = max(0, 100 - used)
-            let qColor: CGColor = remaining > 50 ? Color.green
-                : (remaining > 20 ? Color.orange : Color.red)
-            Draw.bar(ctx, x: innerX, y: y + h - 10, w: innerW, h: 6,
-                     percent: remaining, color: qColor)
-        }
+        let quota = quotaPresentation(usage)
+        let quotaY = y + h - 36
+        Draw.text(ctx, quota.remainingText, x: innerX, y: quotaY,
+                  font: Fonts.system(15, weight: .semibold), color: quota.color)
+        let resetFont = Fonts.system(13)
+        let resetW = (quota.resetText as NSString).size(withAttributes: [.font: resetFont]).width
+        Draw.text(ctx, quota.resetText,
+                  x: Int(CGFloat(innerX + innerW) - resetW), y: quotaY + 2,
+                  font: resetFont,
+                  color: usage.quotaResetsAt == nil ? Color.textD : Color.textS)
+        Draw.bar(ctx, x: innerX, y: y + h - 9, w: innerW, h: 5,
+                 percent: quota.remaining ?? 0, color: quota.color)
     }
 
     private func renderAgentColumn(_ ctx: CGContext, x: Int, w: Int, py: Int,
@@ -815,26 +828,44 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                       font: ioFont, color: Color.textL)
         }
 
-        // Quota (Codex): remaining percentage + reset countdown + bar
-        if let used = usage.quotaUsedPercent {
-            let remaining = max(0, 100 - used)
-            let qColor: CGColor = remaining > 50 ? Color.green
-                : (remaining > 20 ? Color.orange : Color.red)
-            let qy = tokY + 78
-            Draw.text(ctx, String(format: "剩余额度 %.0f%%", remaining), x: x, y: qy,
-                      font: Fonts.system(21, weight: .medium), color: qColor)
-            if let resets = usage.quotaResetsAt {
-                let secs = max(0, Int(resets.timeIntervalSinceNow))
-                let resetStr = secs >= 86400 ? "\(secs / 86400)天后重置"
-                    : (secs >= 3600 ? "\(secs / 3600)小时后重置" : "\(max(secs / 60, 1))分钟后重置")
-                let rFont = Fonts.system(17)
-                let rW = (resetStr as NSString).size(withAttributes: [.font: rFont]).width
-                Draw.text(ctx, resetStr, x: Int(CGFloat(x + w) - rW), y: qy + 3,
-                          font: rFont, color: Color.textD)
-            }
-            Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
-                     percent: remaining, color: qColor)
+        // Quota: always reserve the row so missing local data is explicit rather
+        // than silently disappearing. Reset is an absolute local date/time.
+        let quota = quotaPresentation(usage)
+        let qy = tokY + 78
+        Draw.text(ctx, quota.remainingText, x: x, y: qy,
+                  font: Fonts.system(21, weight: .medium), color: quota.color)
+        let resetFont = Fonts.system(17)
+        let resetW = (quota.resetText as NSString).size(withAttributes: [.font: resetFont]).width
+        Draw.text(ctx, quota.resetText, x: Int(CGFloat(x + w) - resetW), y: qy + 3,
+                  font: resetFont,
+                  color: usage.quotaResetsAt == nil ? Color.textD : Color.textS)
+        Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
+                 percent: quota.remaining ?? 0, color: quota.color)
+    }
+
+    private func quotaPresentation(_ usage: AgentUsage)
+        -> (remaining: Double?, remainingText: String, resetText: String, color: CGColor) {
+        let window = usage.quotaWindowLabel ?? ""
+        let prefix = window.isEmpty || window == "额度" ? "" : "\(window) "
+        let remaining = usage.quotaUsedPercent.map { min(max(100 - $0, 0), 100) }
+        let remainingText = remaining.map { String(format: "\(prefix)剩余 %.0f%%", $0) }
+            ?? "\(prefix)剩余 --"
+        let color: CGColor
+        if let remaining {
+            color = remaining > 50 ? Color.green : (remaining > 20 ? Color.orange : Color.red)
+        } else {
+            color = Color.textD
         }
+        let resetText: String
+        if let reset = usage.quotaResetsAt {
+            let c = Calendar.current.dateComponents([.month, .day, .hour, .minute], from: reset)
+            let label = usage.quotaResetIsEstimated ? "预计重置" : "重置"
+            resetText = String(format: "\(label) %02d-%02d %02d:%02d",
+                               c.month ?? 0, c.day ?? 0, c.hour ?? 0, c.minute ?? 0)
+        } else {
+            resetText = "重置 --"
+        }
+        return (remaining, remainingText, resetText, color)
     }
 
     /// Segmented plan-progress bar: completed steps solid, current bright, pending dim.
