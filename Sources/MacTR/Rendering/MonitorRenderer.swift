@@ -136,7 +136,9 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                    secondsSinceActive: u.secondsSinceActive,
                    project: u.project, activity: u.activity,
                    quotas: u.quotas,
-                   needsAttention: true)
+                   needsAttention: true,
+                   tokensAvailable: u.tokensAvailable,
+                   statusLabel: u.statusLabel)
     }
 
     /// Start background metrics collection. Call before first render().
@@ -198,6 +200,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let visibleAgents = agentDisplayConfig.visibleAgents
         return (visibleAgents.contains(.claude) && (a.claude.isWorking || a.claude.needsAttention))
             || (visibleAgents.contains(.codex) && (a.codex.isWorking || a.codex.needsAttention))
+            || (visibleAgents.contains(.opencode) && (a.opencode.isWorking || a.opencode.needsAttention))
     }
 
     private func metricsLoop(generation: UInt64) {
@@ -311,7 +314,26 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                               ],
                               isWorking: true,
                               stepCurrent: 4, stepTotal: 6,
-                              stepText: "部署到预发环境并跑冒烟测试"))
+                              stepText: "部署到预发环境并跑冒烟测试"),
+            opencode: AgentUsage(available: true,
+                                 todayInputTokens: 0, todayOutputTokens: 0,
+                                 secondsSinceActive: 12, project: "OpenCode Zen",
+                                 activity: "订阅额度实时同步 · 每 60 秒刷新",
+                                 quotas: [
+                                     AgentQuota(usedPercent: 41,
+                                                resetsAt: Date().addingTimeInterval(4 * 3600),
+                                                resetIsEstimated: false,
+                                                windowLabel: "滚动"),
+                                     AgentQuota(usedPercent: 27,
+                                                resetsAt: Date().addingTimeInterval(3 * 24 * 3600),
+                                                resetIsEstimated: false,
+                                                windowLabel: "周"),
+                                     AgentQuota(usedPercent: 63,
+                                                resetsAt: Date().addingTimeInterval(16 * 24 * 3600),
+                                                resetIsEstimated: false,
+                                                windowLabel: "月"),
+                                 ],
+                                 tokensAvailable: false))
         return (cpu, mem, temp, sys, agents)
     }
 
@@ -389,7 +411,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
         if let until = testFlashUntil, Date() < until {
             agents = AgentsSnapshot(claude: withAttention(agents.claude),
-                                    codex: withAttention(agents.codex))
+                                    codex: withAttention(agents.codex),
+                                    opencode: withAttention(agents.opencode))
         }
 
         // Reuse CGContext to prevent CG raster data memory growth
@@ -713,6 +736,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             return ("CLAUDE", Color.claude, agents.claude)
         case .codex:
             return ("CODEX", Color.cyan, agents.codex)
+        case .opencode:
+            return ("OPENCODE", Color.opencode, agents.opencode)
         }
     }
 
@@ -749,7 +774,11 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
         let active = (usage.secondsSinceActive ?? Int.max) < 90
         let agoStr: String
-        if !usage.available {
+        if let label = usage.statusLabel {
+            // Source-specific status ("未配置" / "Key 无效" / "同步中") wins over the
+            // generic now / Nm-ago phrasing.
+            agoStr = label
+        } else if !usage.available {
             agoStr = "not found"
         } else if let s = usage.secondsSinceActive {
             agoStr = active ? "now"
@@ -759,7 +788,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             agoStr = "no session"
         }
         let agoFont = Fonts.system(15, weight: .medium)
-        let agoColor = active ? Color.green : Color.textD
+        let agoColor = usage.statusLabel != nil ? Color.textS : (active ? Color.green : Color.textD)
         let agoW = (agoStr as NSString).size(withAttributes: [.font: agoFont]).width
         Draw.text(ctx, agoStr, x: Int(CGFloat(innerX + innerW) - agoW), y: y + 15,
                   font: agoFont, color: agoColor)
@@ -788,6 +817,33 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             cy += 16
         }
 
+        // Quota-first layout: token-less sources (OpenCode) and three-window plans
+        // need the whole card for quota rows, so the token / In-Out / message blocks
+        // are omitted and the rows are bottom-aligned inside the card.
+        if !usage.tokensAvailable || quotas.count >= 3 {
+            let quotaStride = 32
+            let barOffset = 25
+            let barHeight = 5
+            let bottomInset = 12
+            // Last bar's bottom edge sits `bottomInset` above the card bottom.
+            let firstQuotaY = y + h - bottomInset - barHeight - barOffset
+                - (quotas.count - 1) * quotaStride
+            for (index, quota) in quotas.enumerated() {
+                let quotaY = firstQuotaY + index * quotaStride
+                Draw.text(ctx, quota.remainingText, x: innerX, y: quotaY,
+                          font: Fonts.system(15, weight: .semibold), color: quota.color)
+                let resetFont = Fonts.system(13)
+                let resetW = (quota.resetText as NSString).size(withAttributes: [.font: resetFont]).width
+                Draw.text(ctx, quota.resetText,
+                          x: Int(CGFloat(innerX + innerW) - resetW), y: quotaY + 2,
+                          font: resetFont,
+                          color: quota.hasReset ? Color.textS : Color.textD)
+                Draw.bar(ctx, x: innerX, y: quotaY + barOffset, w: innerW, h: barHeight,
+                         percent: quota.remaining ?? 0, color: quota.color)
+            }
+            return
+        }
+
         // Two Claude windows consume the compact card's former activity-text slot.
         // Project, plan badge, token totals, and both quota rows remain visible.
         let tokenY = quotas.count > 1 ? y + h - 116 : y + h - 90
@@ -800,7 +856,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: innerX + innerW, y: tokenY - 8), color: Color.border)
         Draw.text(ctx, "今日 Token", x: innerX, y: tokenY,
                   font: Fonts.system(15), color: Color.textL)
-        Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: innerX, y: tokenY + 18,
+        Draw.text(ctx, usage.tokensAvailable ? formatTokensCN(usage.todayTotalTokens) : "—",
+                  x: innerX, y: tokenY + 18,
                   font: Fonts.system(quotas.count > 1 ? 22 : 27, weight: .bold), color: Color.textW)
 
         let ioFont = Fonts.system(15, weight: .medium)
@@ -810,7 +867,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         ]
         for (index, row) in rows.enumerated() {
             let ry = tokenY + 2 + index * 20
-            let value = formatTokensCN(row.1)
+            let value = usage.tokensAvailable ? formatTokensCN(row.1) : "—"
             let valueW = (value as NSString).size(withAttributes: [.font: ioFont]).width
             Draw.text(ctx, value, x: Int(CGFloat(innerX + innerW) - valueW), y: ry,
                       font: ioFont, color: Color.textS)
@@ -884,7 +941,11 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   font: Fonts.system(24, weight: .bold), color: accent)
         let active = (usage.secondsSinceActive ?? Int.max) < 90
         let agoStr: String
-        if !usage.available {
+        if let label = usage.statusLabel {
+            // Source-specific status ("未配置" / "Key 无效" / "同步中") wins over the
+            // generic now / Nm-ago phrasing.
+            agoStr = label
+        } else if !usage.available {
             agoStr = "not found"
         } else if let s = usage.secondsSinceActive {
             agoStr = active ? "now"
@@ -894,7 +955,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             agoStr = "no session"
         }
         let agoFont = Fonts.system(17, weight: .medium)
-        let agoColor = active ? Color.green : Color.textD
+        let agoColor = usage.statusLabel != nil ? Color.textS : (active ? Color.green : Color.textD)
         let agoW = (agoStr as NSString).size(withAttributes: [.font: agoFont]).width
         Draw.text(ctx, agoStr, x: Int(CGFloat(x + w) - agoW), y: py + 56,
                   font: agoFont, color: agoColor)
@@ -944,7 +1005,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
         Draw.text(ctx, "今日 Token", x: x, y: tokY,
                   font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
+        Draw.text(ctx, usage.tokensAvailable ? formatTokensCN(usage.todayTotalTokens) : "—",
+                  x: x, y: tokY + 24,
                   font: Fonts.system(46, weight: .bold), color: Color.textW)
 
         // In / Out — right-aligned, level with the label + big number
@@ -955,7 +1017,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         ]
         for (i, row) in ioRows.enumerated() {
             let ry = tokY + 6 + i * 30
-            let valStr = formatTokensCN(row.1)
+            let valStr = usage.tokensAvailable ? formatTokensCN(row.1) : "—"
             let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
             Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
                       font: ioFont, color: Color.textS)

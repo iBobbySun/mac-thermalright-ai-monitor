@@ -35,6 +35,9 @@ enum Color {
     static let magenta = CGColor(red: 217/255, green: 70/255, blue: 239/255, alpha: 1)
     static let magentaD = CGColor(red: 80/255, green: 28/255, blue: 90/255, alpha: 1)
     static let claude = CGColor(red: 217/255, green: 119/255, blue: 87/255, alpha: 1)  // Claude brand terracotta
+    /// OpenCode brand token. Shares the magenta value (no dedicated brand hue yet),
+    /// kept as its own symbol so the agent accent can be re-tinted in one place.
+    static let opencode = CGColor(red: 217/255, green: 70/255, blue: 239/255, alpha: 1)
 
     static let barBG = CGColor(red: 30/255, green: 34/255, blue: 48/255, alpha: 1)
 
@@ -79,8 +82,21 @@ enum Layout {
 enum AgentKind: String, CaseIterable, Identifiable, Sendable {
     case claude
     case codex
+    case opencode
 
     var id: String { rawValue }
+
+    /// Panel header / Settings label.
+    var displayName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .opencode: return "OpenCode"
+        }
+    }
+
+    /// Declaration order — it decides the on-screen column order (claude → codex → opencode).
+    var sortIndex: Int { Self.allCases.firstIndex(of: self) ?? 0 }
 }
 
 enum AgentLayoutDirection: String, CaseIterable, Identifiable, Sendable {
@@ -92,53 +108,97 @@ enum AgentLayoutDirection: String, CaseIterable, Identifiable, Sendable {
 
 struct AgentDisplayConfig: Equatable, Sendable {
     private enum DefaultsKey {
-        static let showClaude = "agentDisplay.showClaude"
-        static let showCodex = "agentDisplay.showCodex"
+        /// Canonical key: comma-separated `AgentKind` raw values, e.g. "codex,opencode".
+        static let agents = "agentDisplay.agents"
         static let layoutDirection = "agentDisplay.layoutDirection"
+        /// Pre-OpenCode keys, read once for migration and never written again.
+        static let legacyShowClaude = "agentDisplay.showClaude"
+        static let legacyShowCodex = "agentDisplay.showCodex"
     }
 
-    var showClaude: Bool
-    var showCodex: Bool
+    /// The dashboard shows at most two agent columns/cards at a time.
+    static let maxVisibleAgents = 2
+
+    /// Selected agents, in declaration order. `normalized` is the canonical form.
+    var selectedAgents: [AgentKind]
     var layoutDirection: AgentLayoutDirection
 
     static let defaultValue = AgentDisplayConfig(
-        showClaude: false,
-        showCodex: true,
+        selectedAgents: [.codex],
         layoutDirection: .horizontal)
 
+    /// Deduplicated, enum-ordered, capped at `maxVisibleAgents`; empty falls back to `[.codex]`.
     var normalized: AgentDisplayConfig {
-        if showClaude || showCodex { return self }
-        return AgentDisplayConfig(showClaude: false, showCodex: true, layoutDirection: layoutDirection)
+        var seen: Set<AgentKind> = []
+        let unique = selectedAgents.filter { seen.insert($0).inserted }
+        let ordered = unique.sorted { $0.sortIndex < $1.sortIndex }
+        let capped = Array(ordered.prefix(Self.maxVisibleAgents))
+        return AgentDisplayConfig(
+            selectedAgents: capped.isEmpty ? Self.defaultValue.selectedAgents : capped,
+            layoutDirection: layoutDirection)
     }
 
-    var visibleAgents: [AgentKind] {
-        let config = normalized
-        var agents: [AgentKind] = []
-        if config.showClaude { agents.append(.claude) }
-        if config.showCodex { agents.append(.codex) }
-        return agents
+    var visibleAgents: [AgentKind] { normalized.selectedAgents }
+
+    func shows(_ agent: AgentKind) -> Bool { normalized.selectedAgents.contains(agent) }
+
+    /// True when the agent is already selected or another one can still be added.
+    func canSelect(_ agent: AgentKind) -> Bool {
+        let agents = normalized.selectedAgents
+        return agents.contains(agent) || agents.count < Self.maxVisibleAgents
+    }
+
+    /// Flip one agent in/out of the selection. Adding is a no-op when already full.
+    mutating func toggle(_ agent: AgentKind) {
+        var agents = normalized.selectedAgents
+        if let index = agents.firstIndex(of: agent) {
+            agents.remove(at: index)
+        } else if agents.count < Self.maxVisibleAgents {
+            agents.append(agent)
+        }
+        selectedAgents = agents
+        self = normalized
     }
 
     static func load() -> AgentDisplayConfig {
         let defaults = UserDefaults.standard
-        let showClaude = defaults.object(forKey: DefaultsKey.showClaude) as? Bool
-            ?? defaultValue.showClaude
-        let showCodex = defaults.object(forKey: DefaultsKey.showCodex) as? Bool
-            ?? defaultValue.showCodex
         let layoutDirection = (defaults.string(forKey: DefaultsKey.layoutDirection)
             .flatMap(AgentLayoutDirection.init(rawValue:))) ?? defaultValue.layoutDirection
-        return AgentDisplayConfig(
-            showClaude: showClaude,
-            showCodex: showCodex,
-            layoutDirection: layoutDirection).normalized
+
+        let agents: [AgentKind]
+        if let raw = defaults.string(forKey: DefaultsKey.agents) {
+            agents = raw.split(separator: ",").compactMap {
+                AgentKind(rawValue: $0.trimmingCharacters(in: .whitespaces).lowercased())
+            }
+        } else {
+            // One-time migration from the old two-toggle config. Missing legacy keys
+            // keep the historical default: Claude off, Codex on.
+            let showClaude = defaults.object(forKey: DefaultsKey.legacyShowClaude) as? Bool ?? false
+            let showCodex = defaults.object(forKey: DefaultsKey.legacyShowCodex) as? Bool ?? true
+            var migrated: [AgentKind] = []
+            if showClaude { migrated.append(.claude) }
+            if showCodex { migrated.append(.codex) }
+            agents = migrated
+        }
+        return AgentDisplayConfig(selectedAgents: agents,
+                                  layoutDirection: layoutDirection).normalized
     }
 
     func save() {
         let config = normalized
         let defaults = UserDefaults.standard
-        defaults.set(config.showClaude, forKey: DefaultsKey.showClaude)
-        defaults.set(config.showCodex, forKey: DefaultsKey.showCodex)
+        defaults.set(config.selectedAgents.map(\.rawValue).joined(separator: ","),
+                     forKey: DefaultsKey.agents)
         defaults.set(config.layoutDirection.rawValue, forKey: DefaultsKey.layoutDirection)
+        // Legacy keys are intentionally left in place so an older build still reads a
+        // sane config after a rollback.
+    }
+
+    // MARK: - Init
+
+    init(selectedAgents: [AgentKind], layoutDirection: AgentLayoutDirection) {
+        self.selectedAgents = selectedAgents
+        self.layoutDirection = layoutDirection
     }
 }
 

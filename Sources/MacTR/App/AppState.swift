@@ -37,9 +37,14 @@ final class AppState {
     var brightness: Int = 5
     var refreshInterval: Double = 0.5
     var rotateDisplay: Bool = false
-    var showClaudeAgent: Bool
-    var showCodexAgent: Bool
+    var selectedAgents: [AgentKind]
     var agentLayoutDirection: AgentLayoutDirection
+
+    // OpenCode API key (Settings → Agents). Only the fingerprint is ever surfaced.
+    var openCodeKeyConfigured: Bool = OpenCodeKeyStore.isConfigured
+    var openCodeKeyFingerprint: String? = OpenCodeKeyStore.fingerprint
+    var openCodeKeyStatus: String = ""
+    var openCodeKeyTesting: Bool = false
 
     // Metrics (for menu bar display)
     var frameCount = 0
@@ -53,8 +58,7 @@ final class AppState {
 
     init() {
         let agentDisplay = AgentDisplayConfig.load()
-        showClaudeAgent = agentDisplay.showClaude
-        showCodexAgent = agentDisplay.showCodex
+        selectedAgents = agentDisplay.selectedAgents
         agentLayoutDirection = agentDisplay.layoutDirection
     }
 
@@ -131,16 +135,72 @@ final class AppState {
 
     private var agentDisplayConfig: AgentDisplayConfig {
         AgentDisplayConfig(
-            showClaude: showClaudeAgent,
-            showCodex: showCodexAgent,
+            selectedAgents: selectedAgents,
             layoutDirection: agentLayoutDirection).normalized
     }
 
     private func normalizeAgentDisplaySettings() {
         let normalized = agentDisplayConfig
-        showClaudeAgent = normalized.showClaude
-        showCodexAgent = normalized.showCodex
+        selectedAgents = normalized.selectedAgents
         agentLayoutDirection = normalized.layoutDirection
+    }
+
+    // MARK: - OpenCode API key
+
+    /// True when `agent` may be checked in Settings right now.
+    func canSelectAgent(_ agent: AgentKind) -> Bool {
+        agentDisplayConfig.canSelect(agent)
+    }
+
+    /// The dashboard always shows at least one agent, so the last remaining
+    /// selection cannot be unchecked (the config would otherwise snap back to Codex).
+    func isLastSelectedAgent(_ agent: AgentKind) -> Bool {
+        let agents = agentDisplayConfig.selectedAgents
+        return agents.count == 1 && agents.contains(agent)
+    }
+
+    /// Flip an agent on/off. Adding a third agent is a no-op (max 2 visible).
+    func toggleAgent(_ agent: AgentKind) {
+        var config = agentDisplayConfig
+        guard config.canSelect(agent) else { return }
+        config.toggle(agent)
+        selectedAgents = config.selectedAgents
+        applySettings()
+    }
+
+    private func refreshOpenCodeKeyState() {
+        openCodeKeyConfigured = OpenCodeKeyStore.isConfigured
+        openCodeKeyFingerprint = OpenCodeKeyStore.fingerprint
+    }
+
+    /// Verify the candidate key against OpenCode, then store it encrypted.
+    /// A rejected key is not saved, so a typo cannot break a working configuration.
+    func saveAndTestOpenCodeKey(_ raw: String) async {
+        let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty else {
+            openCodeKeyStatus = "❌ 请输入 API Key"
+            return
+        }
+        openCodeKeyTesting = true
+        openCodeKeyStatus = "正在验证…"
+        let verdict = await OpenCodeUsageClient.probe(key: typed)
+        openCodeKeyTesting = false
+        openCodeKeyStatus = verdict
+
+        guard verdict.hasPrefix("✅") else { return }
+        guard OpenCodeKeyStore.setKey(typed) else {
+            openCodeKeyStatus = "❌ 本地加密保存失败"
+            return
+        }
+        refreshOpenCodeKeyState()
+        // The collector notices the revision bump on its next tick (≤2 s) and refreshes.
+        openCodeKeyStatus = verdict + " · 已加密保存"
+    }
+
+    func clearOpenCodeKey() {
+        OpenCodeKeyStore.clear()
+        refreshOpenCodeKeyState()
+        openCodeKeyStatus = "已清除 API Key"
     }
 }
 

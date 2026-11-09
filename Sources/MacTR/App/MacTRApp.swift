@@ -6,6 +6,7 @@
 // CLI mode: --cli flag for headless operation.
 
 import AppKit
+import CryptoKit
 import os
 import SwiftUI
 
@@ -77,10 +78,30 @@ struct MacTREntry {
             return
         }
 
+        // OpenCode usage diagnostics: prints key state + the three quota windows.
+        // Usage: --opencode-usage [--key sk-...]
+        if CommandLine.arguments.contains("--opencode-usage") {
+            runOpenCodeUsageProbe()
+            return
+        }
+
+        // Offline parser check for the usage payload (fixtures / API changes).
+        // Usage: --opencode-parse <json> | @path/to/body.json
+        if CommandLine.arguments.contains("--opencode-parse") {
+            runOpenCodeParseCheck()
+            return
+        }
+
+        // Round-trip check for the encrypted key store (never prints the key).
+        // Usage: --opencode-key-selftest <temporary key>
+        if CommandLine.arguments.contains("--opencode-key-selftest") {
+            runOpenCodeKeySelfTest()
+            return
+        }
+
         // Snapshot mode: render one frame and save as PNG
         // Usage: --snapshot path.png [--cores N]
-        if CommandLine.arguments.contains("--snapshot") {
-            let renderer = MonitorRenderer()
+        if CommandLine.arguments.contains("--snapshot") {            let renderer = MonitorRenderer()
             renderer.updateAgentDisplay(agentDisplayConfig(from: CommandLine.arguments))
             let simCores = parseFlag(CommandLine.arguments, flag: "--cores")
 
@@ -577,7 +598,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let window = NSWindow(contentViewController: hostingController)
         window.title = "MacTR Settings"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 500, height: 430))
+        window.setContentSize(NSSize(width: 500, height: 560))
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -889,14 +910,17 @@ private func parseStringFlag(_ args: [String], flag: String) -> String? {
 
 private func agentDisplayConfig(from args: [String]) -> AgentDisplayConfig {
     var config = AgentDisplayConfig.load()
-    if let agents = parseStringFlag(args, flag: "--agents")?.lowercased() {
-        let parts = Set(agents.split(separator: ",").map { String($0.trimmingCharacters(in: .whitespaces)) })
-        if parts.contains("both") || parts.contains("all") {
-            config.showClaude = true
-            config.showCodex = true
+    if let agents = parseStringFlag(args, flag: "--agents") {
+        // Comma-separated, case-insensitive, surrounding spaces tolerated.
+        let parts = agents.lowercased()
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        if parts.contains("all") || parts.contains("both") {
+            // Historical spelling for "the two original agents" (enum order).
+            config.selectedAgents = Array(AgentKind.allCases.prefix(2))
         } else {
-            config.showClaude = parts.contains("claude")
-            config.showCodex = parts.contains("codex")
+            // Unknown names are ignored; `normalized` caps the result at two columns.
+            config.selectedAgents = parts.compactMap(AgentKind.init(rawValue:))
         }
     }
     let layoutFlag = parseStringFlag(args, flag: "--dashboard-layout")
@@ -906,6 +930,146 @@ private func agentDisplayConfig(from args: [String]) -> AgentDisplayConfig {
         config.layoutDirection = direction
     }
     return config.normalized
+}
+
+// MARK: - OpenCode Diagnostics
+
+/// Print the stored key's state (never the key itself) and the live quota windows.
+/// `--key` overrides the stored key, so a candidate can be checked before saving.
+private func runOpenCodeUsageProbe() {
+    let args = CommandLine.arguments
+    let overrideKey = parseStringFlag(args, flag: "--key")
+
+    if overrideKey != nil {
+        print("[OpenCode] Using the --key argument (stored key not read)")
+    } else if OpenCodeKeyStore.isConfigured {
+        print("[OpenCode] Key: configured · MD5 fingerprint \(OpenCodeKeyStore.fingerprint?.prefix(8) ?? "?")… "
+              + "· revision \(OpenCodeKeyStore.revision)")
+    } else {
+        print("[OpenCode] Key: not configured — set it in Settings → Agents")
+    }
+
+    guard let key = overrideKey ?? OpenCodeKeyStore.apiKey() else {
+        print("[OpenCode] No key, so no request is made.")
+        return
+    }
+
+    print("[OpenCode] GET https://opencode.ai/zen/go/v1/usage …")
+    // Bridge the async probe to this synchronous CLI entry point. The box is the
+    // only cross-context state, so Swift 6 does not have to reason about a captured var.
+    let box = VerdictBox()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        box.set(await OpenCodeUsageClient.probe(key: key))
+        semaphore.signal()
+    }
+    if semaphore.wait(timeout: .now() + 20) == .timedOut {
+        print("[OpenCode] ❌ 请求超时")
+        return
+    }
+    print("[OpenCode] \(box.value)")
+}
+
+/// One-shot result slot for the CLI probe (written in a Task, read after a semaphore).
+private final class VerdictBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = ""
+
+    var value: String {
+        lock.lock(); defer { lock.unlock() }
+        return stored
+    }
+
+    func set(_ verdict: String) {
+        lock.lock(); defer { lock.unlock() }
+        stored = verdict
+    }
+}
+
+/// Parse a payload without touching the network.
+private func runOpenCodeParseCheck() {
+    let args = CommandLine.arguments
+    guard let source = parseStringFlag(args, flag: "--opencode-parse") else {
+        print("[OpenCode] usage: --opencode-parse '<json>' | @file.json")
+        return
+    }
+
+    let json: String
+    if source.hasPrefix("@") {
+        let path = String(source.dropFirst())
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            print("[OpenCode][ERROR] cannot read \(path)")
+            return
+        }
+        json = contents
+    } else {
+        json = source
+    }
+
+    let data = Data(json.utf8)
+    switch OpenCodeUsageClient.parse(data) {
+    case .success(let quotas):
+        print("[OpenCode] \(quotas.count) window(s):")
+        for quota in quotas {
+            let used = quota.usedPercent.map { String(format: "%.0f%%", $0) } ?? "—"
+            let remaining = quota.usedPercent.map { String(format: "%.0f%%", 100 - $0) } ?? "—"
+            let reset = quota.resetsAt.map {
+                ISO8601DateFormatter().string(from: $0)
+            } ?? "no reset"
+            print("  \(quota.windowLabel): used \(used) · remaining \(remaining) · reset \(reset)")
+        }
+    case .failure(let error):
+        print("[OpenCode] parse failure: \(error.shortLabel) — \(error.message)")
+    }
+}
+
+/// Verify the encrypt→decrypt round trip and restore whatever was stored before.
+private func runOpenCodeKeySelfTest() {
+    let args = CommandLine.arguments
+    guard let candidate = parseStringFlag(args, flag: "--opencode-key-selftest"),
+          !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+        print("[OpenCode] usage: --opencode-key-selftest '<temporary key>'")
+        return
+    }
+
+    let previousKey = OpenCodeKeyStore.apiKey()
+    defer {
+        // Restore the user's real key, or leave the store unconfigured.
+        if let previousKey {
+            _ = OpenCodeKeyStore.setKey(previousKey)
+        } else {
+            OpenCodeKeyStore.clear()
+        }
+        print("[OpenCode] Store restored (configured=\(OpenCodeKeyStore.isConfigured))")
+    }
+
+    let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+    print("[OpenCode] Round trip for a \(trimmed.count)-character test key")
+    guard OpenCodeKeyStore.setKey(trimmed) else {
+        print("[OpenCode][FAIL] setKey refused the value")
+        return
+    }
+
+    let decrypted = OpenCodeKeyStore.apiKey()
+    let expectedFingerprint = Data(Insecure.MD5.hash(data: Data(trimmed.utf8)))
+        .map { String(format: "%02x", $0) }.joined()
+
+    print("  decrypt    : \(decrypted == trimmed ? "OK" : "MISMATCH")")
+    print("  fingerprint: \(OpenCodeKeyStore.fingerprint == expectedFingerprint ? "OK" : "MISMATCH") "
+          + "(\(OpenCodeKeyStore.fingerprint?.prefix(8) ?? "?")…)")
+    print("  configured : \(OpenCodeKeyStore.isConfigured)")
+    print("  plaintext on disk: "
+          + (storedDefaultsContain(trimmed) ? "FOUND — BUG" : "not found (encrypted)"))
+}
+
+/// Scans the persisted preference domain for a plaintext occurrence of `needle`.
+private func storedDefaultsContain(_ needle: String) -> Bool {
+    let domain = "com.beret21.MacTR"
+    let plistPath = ("~/Library/Preferences/" + domain + ".plist" as NSString).expandingTildeInPath
+    guard let data = FileManager.default.contents(atPath: plistPath) else { return false }
+    let haystack = String(decoding: data, as: UTF8.self)
+    return haystack.contains(needle) || data.range(of: Data(needle.utf8)) != nil
 }
 
 // MARK: - Test Image

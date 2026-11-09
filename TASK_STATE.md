@@ -1,5 +1,13 @@
 # TASK_STATE
 
+## 2026-11-09 接入 OpenCode 用量（API）与「最多同屏 2 个 Agent」
+
+- 完成内容：OpenCode Zen 订阅额度（滚动 / 周 / 月）经 `GET https://opencode.ai/zen/go/v1/usage`（Bearer）接入 AI Agents 面板，复用 Claude/Codex 的卡片渲染（项目名、状态点、剩余百分比、重置时间、进度条）；设置页新增 **Agents** Tab：三个 agent 的显示开关（最多同屏 2 个）+ OpenCode API Key 录入 / 保存并测试 / 清除；Key 以 MD5 派生密钥 + AES-GCM 加密后存本机偏好设置，界面仅显示 MD5 指纹；未配置 Key 时零网络请求。
+- 关键决策：MD5 单向不可逆，只存哈希会导致无法再调用 API，因此落地为「MD5(本机随机 secret‖每次保存的 salt) 派生 AES-128 密钥 → AES-GCM 加密存 payload」，UI 只暴露 MD5 指纹，README 明确标注这是本机混淆级保护而非抗本地攻击的强加密；用量接口只返回 status/percent/resetsAt，故 OpenCode 栏「今日 Token」统一渲染 `—` 而不伪造 0；额度恒输出 3 条（缺失窗口 usedPercent=nil）以免行数跳动，紧凑卡为 3 行额度新增「额度优先」分支（`!tokensAvailable || count >= 3`），Claude/Codex 现有像素布局保持不变；采集循环（约 2s）只做锁保护快照与节流判定（成功 60s / 失败 30s / 8s 超时 / 单飞），网络在 Task 内异步，绝不阻塞 metrics 队列；存储用 `UserDefaults(suiteName:)` 让 CLI 诊断与 GUI 共享同一域，当自身 bundle id 等于该域时改用 `.standard`，消除 macOS 的 "own bundle identifier as suite name" 警告；显示上限在 `AgentDisplayConfig.normalized` 强制裁剪到 2，设置页禁用第三个开关并禁止取消最后一个 agent；旧配置（`agentDisplay.showClaude/showCodex`）在 `agentDisplay.agents` 缺失时一次性迁移，保持用户既有视图。
+- 修改文件：`Sources/MacTR/Metrics/AgentUsageCollector.swift`、新增 `Sources/MacTR/Metrics/OpenCodeKeyStore.swift`、`Sources/MacTR/Metrics/OpenCodeUsageClient.swift`、`Sources/MacTR/Rendering/DesignTokens.swift`、`Sources/MacTR/Rendering/MonitorRenderer.swift`、`Sources/MacTR/App/AppState.swift`、`Sources/MacTR/App/MacTRApp.swift`（新增 `--opencode-usage` / `--opencode-parse` / `--opencode-key-selftest` 诊断）、`Sources/MacTR/UI/SettingsView.swift`、`Sources/MacTR/Resources/Info.plist`（1.3.11 → 1.4.0）、`README.md`、`README.en.md`、`TASK_STATE.md`。
+- 验证结果：release 构建与 `codesign --verify --deep --strict` 通过，`git diff --check` / `plutil -lint` / `bash -n` 通过，新增代码零 warning（仅既有 BongoCat/Pikachu 与 libusb link 警告）；解析器 6 组夹具（标准三窗口 / legacy `windows[]` / 401 错误体 / 空 JSON / percent 150 / 缺 resetsAt）逐条核对通过；真实网络下假 Key 返回「Key 无效（401）」，用户本机真 Key 返回「滚动剩余 97% / 周剩余 99% / 月剩余 100%」；加密往返读写一致、指纹与 `md5 -s` 一致、偏好设置二进制中零处明文 `sk-`、自测后原值自动恢复；快照（1540×480、1920×480、519×1404）覆盖 opencode 单栏、claude+opencode、codex+opencode 横纵、claude+codex 回归、三 agent 裁剪到 2 以及真实数据预览，均无重叠或越界，Claude/Codex 卡片与改动前一致；设置页实机截图确认 Agents Tab（Codex/OpenCode 开、Claude 禁用、2/2 提示、已配置状态与 MD5 指纹 b0b845a2…、清除按钮与加密说明）完整显示。
+- 未解决问题：`/Applications/MacTR.app` 未替换（会覆盖现有安装，待用户确认）；未接 Thermalright LCD 做真机回归；OpenCode 成功路径目前只在用户本机 Key 上验证过一次。
+
 ## 2026-09-01 Codex 预留 5 小时并同时显示双额度
 
 - 完成内容：Codex 与 Claude 一样固定输出“5 小时”和“7 天”两项额度；当前 Pro 事件不含 5 小时窗口时显示“5 小时剩余 --”，保留 7 天实时百分比和重置时间。

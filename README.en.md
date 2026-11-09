@@ -17,20 +17,24 @@ Pikachu hops and crackles with CPU load, clock ticks.</sub>
 
 > Fork of [beret21/MacTR](https://github.com/beret21/MacTR), reworked around a central
 > **AI Agents** panel that tracks [Claude Code](https://claude.com/claude-code) and
-> [Codex](https://openai.com/codex) sessions in real time.
+> [Codex](https://openai.com/codex) sessions in real time, plus
+> [OpenCode Zen](https://opencode.ai) subscription quota.
 
 ## Highlights
 
 ### 🤖 AI Agents panel
-Reads your **local** Claude Code and Codex session logs (read-only, no network) and shows,
-for each agent, side by side:
+Reads your **local** Claude Code and Codex session logs (read-only) and — once an API key is
+configured — the OpenCode Zen usage endpoint. Shows 1–2 agents at a time:
 
 - **Current project** and the **last thing it said** — Markdown tables in the message are
   rendered as real aligned tables, not raw `| … |` text.
 - **Plan / step progress** — `步骤 4/6` badge + a segmented progress bar, parsed from
   Codex `update_plan` and Claude `TodoWrite`. Stale plans from a finished turn disappear.
-- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format.
-- **Codex remaining quota** — % left + reset countdown, tracked across all recent sessions.
+- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (the OpenCode
+  usage API reports no token counts, so that column shows `—`).
+- **Remaining quota** — Claude (5-hour / 7-day) and Codex (5-hour / 7-day) from local
+  transcripts, OpenCode (rolling / weekly / monthly) from its usage API; each with the
+  remaining % and reset time.
 - **Live status** — the column **breathes** while an agent is working and **flashes** for
   ~10 s when it finishes a turn or needs your input.
 
@@ -102,6 +106,7 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 "$MACTR_BUILD_DIR/release/MacTR" --snapshot x.png --cores 10   # render one demo frame to a PNG
 "$MACTR_BUILD_DIR/release/MacTR" --gif x.gif --frames 48 --fps 12 --scale 2   # animated demo GIF
 "$MACTR_BUILD_DIR/release/MacTR" --benchmark 120 # measure achievable LCD frame rate
+"$MACTR_BUILD_DIR/release/MacTR" --opencode-usage # diagnostics: OpenCode key status + rolling/weekly/monthly windows
 ```
 
 Only one process can hold the USB device at a time — stop the running instance before
@@ -109,20 +114,47 @@ using `--demo` / `--benchmark`.
 
 ## How agent data is read
 
-MacTR never talks to any network or API. This fork removes the Sparkle auto-updater and only
-reads local session transcripts that the CLIs already write to disk:
+Apart from the sources below, MacTR does not talk to any network or API. This fork removes
+the Sparkle auto-updater; Claude / Codex only read the local transcripts those CLIs already
+write to disk, and the OpenCode quota is **optional** — it is only queried after you enter an
+API key in Settings.
 
 | Agent | Source | What's parsed |
 |---|---|---|
 | Claude Code | `~/.claude/projects/*/*.jsonl` | assistant messages, `usage` tokens, `TodoWrite` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent messages, `token_count`, `rate_limits`, `update_plan` |
+| OpenCode | `GET https://opencode.ai/zen/go/v1/usage` (Bearer API key, optional) | rolling / weekly / monthly usage % and reset times |
 
 Token totals are scoped to the local day; the panel gracefully shows the last session's
 context when an agent hasn't run yet today.
 
+### OpenCode usage (optional)
+
+1. Create an API key in the OpenCode Zen console, open **Settings → Agents**, paste it into the
+   OpenCode field and click "Save & Test".
+2. The key is never written in plain text: an AES-128 key derived as
+   `MD5(local random secret + per-save salt)` encrypts it with AES-GCM into the local
+   preferences, and the UI only shows the key's MD5 fingerprint (first 8 hex chars) for
+   verification. This is on-disk obfuscation — it keeps the key out of casual view, it is not
+   strong protection against a local attacker.
+3. Once configured, the dashboard polls the quota every 60 s. Failures (invalid key, offline,
+   API change) are shown in that column and retried automatically without affecting other panels.
+4. The endpoint only returns status + percentage + reset time, so OpenCode's "Today token"
+   field shows `—`. Clearing the key removes all network traffic.
+
+### Which agents the dashboard shows
+
+Tick Claude / Codex / OpenCode in **Settings → Agents** — **at most 2 are shown at once**
+(the remaining toggles are disabled once two are selected). Orientation still lives in
+**Settings → Display**.
+
 ## Privacy
 
-Everything is local and read-only. No telemetry, no network calls, nothing leaves your Mac.
+Apart from the optional OpenCode quota lookup, everything is local and read-only: no
+telemetry, no third-party network calls. The only outbound request — made only after you
+configure an OpenCode API key — is `GET https://opencode.ai/zen/go/v1/usage` once every 60 s,
+carrying that key as an `Authorization: Bearer` header and no local data at all. Without a key,
+there is no network traffic. The key is stored only on this Mac (see the encryption above).
 
 ## Credits
 

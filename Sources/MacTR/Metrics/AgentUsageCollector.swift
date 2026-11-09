@@ -34,13 +34,16 @@ struct AgentUsage: Sendable {
     let stepCurrent: Int?           // active plan step (1-based); nil = no plan
     let stepTotal: Int?             // total plan steps
     let stepText: String?           // description of the active step
+    let tokensAvailable: Bool       // false = the source exposes no token counts (OpenCode API)
+    let statusLabel: String?        // overrides the right-aligned "now / 12m ago / not found" text
     var todayTotalTokens: UInt64 { todayInputTokens + todayOutputTokens }
 
     init(available: Bool, todayInputTokens: UInt64, todayOutputTokens: UInt64,
          secondsSinceActive: Int?, project: String?, activity: String?,
          quotas: [AgentQuota] = [],
          needsAttention: Bool = false, isWorking: Bool = false,
-         stepCurrent: Int? = nil, stepTotal: Int? = nil, stepText: String? = nil) {
+         stepCurrent: Int? = nil, stepTotal: Int? = nil, stepText: String? = nil,
+         tokensAvailable: Bool = true, statusLabel: String? = nil) {
         self.available = available
         self.todayInputTokens = todayInputTokens
         self.todayOutputTokens = todayOutputTokens
@@ -53,12 +56,15 @@ struct AgentUsage: Sendable {
         self.stepCurrent = stepCurrent
         self.stepTotal = stepTotal
         self.stepText = stepText
+        self.tokensAvailable = tokensAvailable
+        self.statusLabel = statusLabel
     }
 }
 
 struct AgentsSnapshot: Sendable {
     let claude: AgentUsage
     let codex: AgentUsage
+    let opencode: AgentUsage
 }
 
 // MARK: - Collector
@@ -70,6 +76,10 @@ final class AgentUsageCollector: @unchecked Sendable {
     private let fileResourceKeys: Set<URLResourceKey> = [
         .isRegularFileKey, .contentModificationDateKey, .fileSizeKey,
     ]
+
+    /// API-backed quota source for OpenCode Zen (no local transcripts to read).
+    /// The client does its own throttling and never blocks this collector's thread.
+    private let openCodeClient = OpenCodeUsageClient()
 
     private lazy var localDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -196,7 +206,8 @@ final class AgentUsageCollector: @unchecked Sendable {
 
     func collect() -> AgentsSnapshot {
         rolloverIfNeeded()
-        return AgentsSnapshot(claude: collectClaude(), codex: collectCodex())
+        return AgentsSnapshot(claude: collectClaude(), codex: collectCodex(),
+                              opencode: collectOpenCode())
     }
 
     /// Reset accumulators at local midnight. Timestamps in both formats are
@@ -710,6 +721,63 @@ final class AgentUsageCollector: @unchecked Sendable {
             return (i + 1, total, clean(items[i].text))
         }
         return (total, total, clean(items.last?.text ?? ""))
+    }
+
+    // MARK: - OpenCode (API-backed)
+
+    /// OpenCode Zen exposes its subscription windows over HTTPS rather than in local
+    /// session files. The client refreshes itself in the background (throttled to
+    /// 60 s on success / 30 s on failure, one request in flight), so the high-frequency
+    /// metrics loop only pays for a lock-guarded snapshot read here.
+    ///
+    /// The status slot semantics:
+    ///   unconfigured      → 未配置
+    ///   configured, first → 同步中
+    ///   success           → nil (renderer shows "now" / "Xm ago" from secondsSinceActive)
+    ///   failure           → error.shortLabel, last known quotas kept
+    private func collectOpenCode() -> AgentUsage {
+        openCodeClient.refreshIfNeeded()
+        let state = openCodeClient.state()
+        let age = state.lastSuccessAt.map { max(0, Int(Date().timeIntervalSince($0))) }
+
+        guard state.isConfigured else {
+            return AgentUsage(
+                available: false, todayInputTokens: 0, todayOutputTokens: 0,
+                secondsSinceActive: nil, project: "OpenCode Zen",
+                activity: "在 设置 → Agents 中填入 OpenCode API Key",
+                quotas: OpenCodeUsageClient.placeholderQuotas,
+                tokensAvailable: false,
+                statusLabel: "未配置")
+        }
+
+        if let error = state.lastError {
+            return AgentUsage(
+                available: true, todayInputTokens: 0, todayOutputTokens: 0,
+                secondsSinceActive: age, project: "OpenCode Zen",
+                activity: "刷新失败：\(error.message)（将自动重试）",
+                quotas: state.quotas,
+                tokensAvailable: false,
+                statusLabel: error.shortLabel)
+        }
+
+        // Configured but the first response hasn't landed yet.
+        guard state.lastSuccessAt != nil else {
+            return AgentUsage(
+                available: true, todayInputTokens: 0, todayOutputTokens: 0,
+                secondsSinceActive: nil, project: "OpenCode Zen",
+                activity: "正在获取 OpenCode 额度…",
+                quotas: state.quotas,
+                tokensAvailable: false,
+                statusLabel: "同步中")
+        }
+
+        return AgentUsage(
+            available: true, todayInputTokens: 0, todayOutputTokens: 0,
+            secondsSinceActive: age, project: "OpenCode Zen",
+            activity: "订阅额度实时同步 · 每 60 秒刷新",
+            quotas: state.quotas,
+            tokensAvailable: false,
+            statusLabel: nil)
     }
 
     // MARK: - Codex

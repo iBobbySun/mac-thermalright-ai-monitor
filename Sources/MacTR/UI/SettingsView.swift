@@ -1,6 +1,6 @@
 // SettingsView.swift — Settings window (SwiftUI)
 //
-// Tabs: General | Display | Device | About
+// Tabs: General | Display | Agents | Device | About
 
 import ServiceManagement
 import SwiftUI
@@ -8,6 +8,7 @@ import SwiftUI
 struct SettingsView: View {
     @Bindable var state: AppState
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var openCodeKeyInput = ""
 
     var body: some View {
         TabView {
@@ -19,6 +20,10 @@ struct SettingsView: View {
                 displaySettings
             }
 
+            Tab("Agents", systemImage: "person.2") {
+                agentSettings
+            }
+
             Tab("Device", systemImage: "cable.connector") {
                 deviceSettings
             }
@@ -27,7 +32,7 @@ struct SettingsView: View {
                 aboutView
             }
         }
-        .frame(width: 500, height: 430)
+        .frame(width: 500, height: 560)
     }
 
     // MARK: - General Tab
@@ -101,21 +106,8 @@ struct SettingsView: View {
                     state.applySettings()
                 }
 
-                Text("Vertical stacks CPU, Agents, and Memory from top to bottom.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("AI Agents") {
-                Toggle("Show Claude", isOn: $state.showClaudeAgent)
-                    .onChange(of: state.showClaudeAgent) {
-                        state.applySettings()
-                    }
-                Toggle("Show Codex", isOn: $state.showCodexAgent)
-                    .onChange(of: state.showCodexAgent) {
-                        state.applySettings()
-                    }
-                Text("Codex stays visible if both agents are turned off.")
+                Text("Vertical stacks CPU, Agents, and Memory from top to bottom. "
+                     + "Which agents appear is set in the Agents tab.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -132,6 +124,115 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
+    }
+
+    // MARK: - Agents Tab
+
+    private var agentSettings: some View {
+        Form {
+            Section {
+                ForEach(AgentKind.allCases) { agent in
+                    Toggle(isOn: agentBinding(agent)) {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(.secondary)
+                                .frame(width: 8, height: 8)
+                            Text(agent.displayName)
+                        }
+                    }
+                    .disabled(!state.canSelectAgent(agent) || state.isLastSelectedAgent(agent))
+                }
+            } header: {
+                Text("Dashboard Agents")
+            } footer: {
+                Text("Pick at most 2 agents to show at once (at least 1 stays on). "
+                     + "Selected: \(state.selectedAgents.count)/\(AgentDisplayConfig.maxVisibleAgents). "
+                     + "Orientation is under Display.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                if state.openCodeKeyConfigured {
+                    LabeledContent("Status") {
+                        HStack(spacing: 6) {
+                            Circle().fill(.green).frame(width: 8, height: 8)
+                            Text("已配置")
+                        }
+                    }
+                    LabeledContent("MD5 指纹", value: fingerprintText)
+                } else {
+                    LabeledContent("Status") {
+                        HStack(spacing: 6) {
+                            Circle().fill(.secondary).frame(width: 8, height: 8)
+                            Text("未配置")
+                        }
+                    }
+                }
+
+                SecureField("OpenCode API Key", text: $openCodeKeyInput)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(state.openCodeKeyTesting)
+
+                HStack(spacing: 8) {
+                    Button("保存并测试") {
+                        let candidate = openCodeKeyInput
+                        Task {
+                            await state.saveAndTestOpenCodeKey(candidate)
+                            if state.openCodeKeyStatus.hasPrefix("✅") {
+                                openCodeKeyInput = ""
+                            }
+                        }
+                    }
+                    .disabled(state.openCodeKeyTesting
+                              || openCodeKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button("清除") {
+                        state.clearOpenCodeKey()
+                        openCodeKeyInput = ""
+                    }
+                    .disabled(!state.openCodeKeyConfigured || state.openCodeKeyTesting)
+
+                    if state.openCodeKeyTesting {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+
+                if !state.openCodeKeyStatus.isEmpty {
+                    Text(state.openCodeKeyStatus)
+                        .font(.caption)
+                        .foregroundStyle(state.openCodeKeyStatus.hasPrefix("✅") ? .green : .secondary)
+                        .textSelection(.enabled)
+                }
+            } header: {
+                Text("OpenCode Usage")
+            } footer: {
+                Text("The key is encrypted with AES-GCM under an MD5-derived local key "
+                     + "before it is saved on this Mac, and is only shown here as an MD5 "
+                     + "fingerprint. MacTR queries opencode.ai/zen/go/v1/usage every 60 s "
+                     + "and makes no network request while no key is set.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+
+    private var fingerprintText: String {
+        guard let fingerprint = state.openCodeKeyFingerprint, fingerprint.count >= 8 else {
+            return "—"
+        }
+        return String(fingerprint.prefix(8)) + "…"
+    }
+
+    /// A checkbox that reflects the selection and flips it through AppState
+    /// (which enforces the 2-agent cap and persists the choice).
+    private func agentBinding(_ agent: AgentKind) -> Binding<Bool> {
+        Binding(
+            get: { state.selectedAgents.contains(agent) },
+            set: { _ in state.toggleAgent(agent) }
+        )
     }
 
     // MARK: - Device Tab
