@@ -38,6 +38,10 @@ enum Color {
     /// OpenCode brand token. Shares the magenta value (no dedicated brand hue yet),
     /// kept as its own symbol so the agent accent can be re-tinted in one place.
     static let opencode = CGColor(red: 217/255, green: 70/255, blue: 239/255, alpha: 1)
+    /// Ollama is a monochrome brand, so the card accent is a light steel blue —
+    /// clearly distinct from Codex cyan, OpenCode magenta and Claude terracotta.
+    /// Kept as its own symbol so the tint can be changed in one place.
+    static let ollama = CGColor(red: 154/255, green: 205/255, blue: 255/255, alpha: 1)
 
     static let barBG = CGColor(red: 30/255, green: 34/255, blue: 48/255, alpha: 1)
 
@@ -83,6 +87,7 @@ enum AgentKind: String, CaseIterable, Identifiable, Sendable {
     case claude
     case codex
     case opencode
+    case ollama
 
     var id: String { rawValue }
 
@@ -92,10 +97,12 @@ enum AgentKind: String, CaseIterable, Identifiable, Sendable {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .opencode: return "OpenCode"
+        case .ollama: return "Ollama"
         }
     }
 
-    /// Declaration order — it decides the on-screen column order (claude → codex → opencode).
+    /// Declaration order — it decides the on-screen column order
+    /// (claude → codex → opencode → ollama).
     var sortIndex: Int { Self.allCases.firstIndex(of: self) ?? 0 }
 }
 

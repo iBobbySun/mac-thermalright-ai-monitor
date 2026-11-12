@@ -1,4 +1,4 @@
-// OpenCodeKeyStore.swift — encrypted-at-rest storage for the OpenCode Zen API key
+// AgentKeyStore.swift — encrypted-at-rest storage for the API-backed agents' keys
 //
 // Threat model: this is LOCAL OBFUSCATION, not strong key protection. The KDF
 // secret lives in the same UserDefaults domain as the ciphertext, so anything
@@ -9,11 +9,16 @@
 // Storage — UserDefaults(suiteName: "com.beret21.MacTR"). That suite is the same
 // persisted domain the GUI app writes (its bundle id), and it also works from the
 // CLI binary, which has no bundle identity (plain `.standard` would land in a
-// different, throwaway domain there):
-//   opencode.apiKey.payload   Data    salt(16B) || AES.GCM sealedBox.combined
-//   opencode.apiKey.md5       String  lowercase hex MD5 of the trimmed key (fingerprint)
-//   opencode.apiKey.revision  Int     bumped on every set/clear (drives refreshes)
-//   opencode.kdf.secret       Data    32-byte random KDF secret, generated lazily once
+// different, throwaway domain there). Every agent gets its own namespace, so a
+// key edit for one agent never touches another:
+//   <agent>.apiKey.payload   Data    salt(16B) || AES.GCM sealedBox.combined
+//   <agent>.apiKey.md5       String  lowercase hex MD5 of the trimmed key (fingerprint)
+//   <agent>.apiKey.revision  Int     bumped on every set/clear (drives refreshes)
+//   <agent>.kdf.secret       Data    32-byte random KDF secret, generated lazily once
+//
+// `<agent>` is the `APIKeyAgent` raw value ("opencode", "ollama"), so the keys
+// written by the pre-generalisation OpenCode store keep their exact spelling and
+// no migration (or re-entry) is needed.
 //
 // Cipher: AES-128-GCM under key = MD5(kdfSecret || salt). MD5 is used here only as
 // a fixed-size key-derivation hash, never as an authentication primitive — GCM
@@ -27,22 +32,34 @@ import CryptoKit
 import Foundation
 import Security
 
-enum OpenCodeKeyStore {
+// MARK: - Namespaces
 
-    // MARK: - Keys
+/// Agents whose credentials are an API key rather than local session transcripts.
+enum APIKeyAgent: String, CaseIterable, Sendable {
+    case opencode
+    case ollama
+}
+
+// MARK: - Store
+
+struct AgentKeyStore: Sendable {
+
+    let agent: APIKeyAgent
+
+    static let openCode = AgentKeyStore(agent: .opencode)
+    static let ollama = AgentKeyStore(agent: .ollama)
+
+    // MARK: Constants
 
     private static let suiteName = "com.beret21.MacTR"
-    private static let payloadKey = "opencode.apiKey.payload"
-    private static let fingerprintKey = "opencode.apiKey.md5"
-    private static let revisionKey = "opencode.apiKey.revision"
-    private static let secretKey = "opencode.kdf.secret"
-
     private static let saltByteCount = 16
     private static let secretByteCount = 32
     private static let fingerprintLength = 32
 
-    /// Serialises reads/writes: the metrics loop decrypts from a background queue
-    /// while the settings UI may be saving a new key on the main thread.
+    /// Serialises reads/writes across every namespace: the metrics loop decrypts
+    /// from a background queue while the settings UI may be saving a new key on
+    /// the main thread. One lock (not one per agent) keeps the shared defaults
+    /// domain single-writer.
     private static let lock = NSLock()
 
     private static var defaults: UserDefaults {
@@ -56,28 +73,35 @@ enum OpenCodeKeyStore {
         return UserDefaults(suiteName: suiteName) ?? .standard
     }
 
-    // MARK: - Public API
+    // MARK: Defaults keys
+
+    private var payloadKey: String { "\(agent.rawValue).apiKey.payload" }
+    private var fingerprintKey: String { "\(agent.rawValue).apiKey.md5" }
+    private var revisionKey: String { "\(agent.rawValue).apiKey.revision" }
+    private var secretKey: String { "\(agent.rawValue).kdf.secret" }
+
+    // MARK: Public API
 
     /// True when a payload exists AND decrypts to a non-empty key.
-    static var isConfigured: Bool {
+    var isConfigured: Bool {
         apiKey() != nil
     }
 
     /// Bumped on every successful set/clear; lets the usage client detect key edits.
-    static var revision: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return defaults.integer(forKey: revisionKey)
+    var revision: Int {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return Self.defaults.integer(forKey: revisionKey)
     }
 
     /// 32 lowercase hex chars — a stable, non-reversible identifier the settings UI
     /// can show instead of the key itself. Nil when no key is stored.
-    static var fingerprint: String? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let raw = defaults.string(forKey: fingerprintKey) else { return nil }
+    var fingerprint: String? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        guard let raw = Self.defaults.string(forKey: fingerprintKey) else { return nil }
         let hex = raw.lowercased()
-        guard hex.count == fingerprintLength,
+        guard hex.count == Self.fingerprintLength,
               hex.allSatisfy({ $0.isHexDigit })
         else { return nil }
         return hex
@@ -86,16 +110,16 @@ enum OpenCodeKeyStore {
     /// Decrypts and trims the stored key. Any failure (missing payload, corrupt
     /// ciphertext, changed KDF secret) reads as "not configured" — never throws,
     /// never logs.
-    static func apiKey() -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let payload = defaults.data(forKey: payloadKey),
-              payload.count > saltByteCount,
+    func apiKey() -> String? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        guard let payload = Self.defaults.data(forKey: payloadKey),
+              payload.count > Self.saltByteCount,
               let secret = storedSecretLocked()
         else { return nil }
 
-        let salt = payload.prefix(saltByteCount)
-        let combined = payload.dropFirst(saltByteCount)
+        let salt = payload.prefix(Self.saltByteCount)
+        let combined = payload.dropFirst(Self.saltByteCount)
         let key = SymmetricKey(data: Data(Insecure.MD5.hash(data: kdfInput(secret, salt))))
 
         guard let box = try? AES.GCM.SealedBox(combined: combined),
@@ -110,19 +134,19 @@ enum OpenCodeKeyStore {
     /// Encrypts and stores `raw`. Whitespace-only input is rejected without writing
     /// anything (so a stray Enter in the settings field cannot wipe a working key).
     @discardableResult
-    static func setKey(_ raw: String) -> Bool {
+    func setKey(_ raw: String) -> Bool {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let plaintext = trimmed.data(using: .utf8) else { return false }
 
-        lock.lock()
-        defer { lock.unlock() }
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
 
         guard let secret = storedSecretLocked() else { return false }
 
-        var salt = Data(count: saltByteCount)
+        var salt = Data(count: Self.saltByteCount)
         let randomStatus = salt.withUnsafeMutableBytes { buffer -> Int32 in
             guard let base = buffer.baseAddress else { return errSecParam }
-            return SecRandomCopyBytes(kSecRandomDefault, saltByteCount, base)
+            return SecRandomCopyBytes(kSecRandomDefault, Self.saltByteCount, base)
         }
         guard randomStatus == errSecSuccess else { return false }
 
@@ -134,9 +158,9 @@ enum OpenCodeKeyStore {
         var payload = salt
         payload.append(combined)
 
-        let defaults = defaults
+        let defaults = Self.defaults
         defaults.set(payload, forKey: payloadKey)
-        defaults.set(fingerprintHex(trimmed), forKey: fingerprintKey)
+        defaults.set(Self.fingerprintHex(trimmed), forKey: fingerprintKey)
         defaults.set(defaults.integer(forKey: revisionKey) + 1, forKey: revisionKey)
         // Push to disk promptly so a separate CLI process sees the new key without
         // waiting for the next periodic flush.
@@ -146,10 +170,10 @@ enum OpenCodeKeyStore {
 
     /// Removes the payload + fingerprint and bumps the revision so the usage client
     /// drops its cached numbers. The KDF secret is intentionally retained.
-    static func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        let defaults = defaults
+    func clear() {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let defaults = Self.defaults
         defaults.removeObject(forKey: payloadKey)
         defaults.removeObject(forKey: fingerprintKey)
         defaults.set(defaults.integer(forKey: revisionKey) + 1, forKey: revisionKey)
@@ -159,7 +183,7 @@ enum OpenCodeKeyStore {
     // MARK: - Internals (always called with `lock` held)
 
     /// Key material for the AES cipher: MD5 over secret || salt.
-    private static func kdfInput(_ secret: Data, _ salt: Data) -> Data {
+    private func kdfInput(_ secret: Data, _ salt: Data) -> Data {
         var material = secret
         material.append(salt)
         return material
@@ -169,15 +193,16 @@ enum OpenCodeKeyStore {
     /// rotation is not attempted when the stored value has the wrong length — that
     /// would silently invalidate an existing payload; callers treat it as "not
     /// configured" instead, which prompts the user to re-enter the key.
-    private static func storedSecretLocked() -> Data? {
-        let defaults = defaults
-        if let existing = defaults.data(forKey: secretKey), existing.count == secretByteCount {
+    private func storedSecretLocked() -> Data? {
+        let defaults = Self.defaults
+        if let existing = defaults.data(forKey: secretKey),
+           existing.count == Self.secretByteCount {
             return existing
         }
-        var secret = Data(count: secretByteCount)
+        var secret = Data(count: Self.secretByteCount)
         let status = secret.withUnsafeMutableBytes { buffer -> Int32 in
             guard let base = buffer.baseAddress else { return errSecParam }
-            return SecRandomCopyBytes(kSecRandomDefault, secretByteCount, base)
+            return SecRandomCopyBytes(kSecRandomDefault, Self.secretByteCount, base)
         }
         guard status == errSecSuccess else { return nil }
         defaults.set(secret, forKey: secretKey)

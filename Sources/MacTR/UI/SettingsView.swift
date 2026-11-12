@@ -9,6 +9,7 @@ struct SettingsView: View {
     @Bindable var state: AppState
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var openCodeKeyInput = ""
+    @State private var ollamaKeyInput = ""
 
     var body: some View {
         TabView {
@@ -32,7 +33,7 @@ struct SettingsView: View {
                 aboutView
             }
         }
-        .frame(width: 500, height: 560)
+        .frame(width: 500, height: 680)
     }
 
     // MARK: - General Tab
@@ -153,19 +154,16 @@ struct SettingsView: View {
             }
 
             Section {
-                if state.openCodeKeyConfigured {
-                    LabeledContent("Status") {
-                        HStack(spacing: 6) {
-                            Circle().fill(.green).frame(width: 8, height: 8)
-                            Text("已配置")
-                        }
-                    }
-                    LabeledContent("MD5 指纹", value: fingerprintText)
-                } else {
-                    LabeledContent("Status") {
-                        HStack(spacing: 6) {
-                            Circle().fill(.secondary).frame(width: 8, height: 8)
-                            Text("未配置")
+                LabeledContent("Status") {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(state.openCodeKeyConfigured ? .green : .secondary)
+                            .frame(width: 8, height: 8)
+                        Text(state.openCodeKeyConfigured ? "已配置" : "未配置")
+                        if state.openCodeKeyConfigured {
+                            Text("· MD5 \(fingerprintText(state.openCodeKeyFingerprint))")
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
                         }
                     }
                 }
@@ -178,8 +176,7 @@ struct SettingsView: View {
                     Button("保存并测试") {
                         let candidate = openCodeKeyInput
                         Task {
-                            await state.saveAndTestOpenCodeKey(candidate)
-                            if state.openCodeKeyStatus.hasPrefix("✅") {
+                            if await state.saveAndTestOpenCodeKey(candidate) {
                                 openCodeKeyInput = ""
                             }
                         }
@@ -207,10 +204,65 @@ struct SettingsView: View {
             } header: {
                 Text("OpenCode Usage")
             } footer: {
-                Text("The key is encrypted with AES-GCM under an MD5-derived local key "
-                     + "before it is saved on this Mac, and is only shown here as an MD5 "
-                     + "fingerprint. MacTR queries opencode.ai/zen/go/v1/usage every 60 s "
-                     + "and makes no network request while no key is set.")
+                Text("AES-GCM at rest; only the MD5 fingerprint is shown. Queries "
+                     + "opencode.ai/zen/go/v1/usage every 60 s — no request without a key.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                LabeledContent("Status") {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(state.ollamaKeyConfigured ? .green : .secondary)
+                            .frame(width: 8, height: 8)
+                        Text(state.ollamaKeyConfigured ? "已配置" : "未配置")
+                        if state.ollamaKeyConfigured {
+                            Text("· MD5 \(fingerprintText(state.ollamaKeyFingerprint))")
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
+                SecureField("Ollama API Key", text: $ollamaKeyInput)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(state.ollamaKeyTesting)
+
+                HStack(spacing: 8) {
+                    Button("保存并测试") {
+                        let candidate = ollamaKeyInput
+                        Task {
+                            if await state.saveAndTestOllamaKey(candidate) {
+                                ollamaKeyInput = ""
+                            }
+                        }
+                    }
+                    .disabled(state.ollamaKeyTesting
+                              || ollamaKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button("清除") {
+                        state.clearOllamaKey()
+                        ollamaKeyInput = ""
+                    }
+                    .disabled(!state.ollamaKeyConfigured || state.ollamaKeyTesting)
+
+                    if state.ollamaKeyTesting {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+
+                if !state.ollamaKeyStatus.isEmpty {
+                    Text(state.ollamaKeyStatus)
+                        .font(.caption)
+                        .foregroundStyle(state.ollamaKeyStatus.hasPrefix("✅") ? .green : .secondary)
+                        .textSelection(.enabled)
+                }
+            } header: {
+                Text("Ollama Usage")
+            } footer: {
+                Text("AES-GCM at rest (key from ollama.com/settings/keys). Queries "
+                     + "ollama.com/api/balance + /api/usage every 60 s — no request without a key.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -219,8 +271,8 @@ struct SettingsView: View {
         .padding()
     }
 
-    private var fingerprintText: String {
-        guard let fingerprint = state.openCodeKeyFingerprint, fingerprint.count >= 8 else {
+    private func fingerprintText(_ fingerprint: String?) -> String {
+        guard let fingerprint, fingerprint.count >= 8 else {
             return "—"
         }
         return String(fingerprint.prefix(8)) + "…"

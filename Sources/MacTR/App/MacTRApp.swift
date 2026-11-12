@@ -99,6 +99,27 @@ struct MacTREntry {
             return
         }
 
+        // Ollama usage diagnostics: key state + live balance/usage snapshot.
+        // Usage: --ollama-usage [--key <api key>]
+        if CommandLine.arguments.contains("--ollama-usage") {
+            runOllamaUsageProbe()
+            return
+        }
+
+        // Offline parser check for the Ollama payloads (fixtures / API changes).
+        // Usage: --ollama-parse balance|usage <json> | @path/to/body.json
+        if CommandLine.arguments.contains("--ollama-parse") {
+            runOllamaParseCheck()
+            return
+        }
+
+        // Round-trip check for the Ollama key slot (never prints the key).
+        // Usage: --ollama-key-selftest <temporary key>
+        if CommandLine.arguments.contains("--ollama-key-selftest") {
+            runOllamaKeySelfTest()
+            return
+        }
+
         // Snapshot mode: render one frame and save as PNG
         // Usage: --snapshot path.png [--cores N]
         if CommandLine.arguments.contains("--snapshot") {            let renderer = MonitorRenderer()
@@ -598,7 +619,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let window = NSWindow(contentViewController: hostingController)
         window.title = "MacTR Settings"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 500, height: 560))
+        window.setContentSize(NSSize(width: 500, height: 680))
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -942,14 +963,14 @@ private func runOpenCodeUsageProbe() {
 
     if overrideKey != nil {
         print("[OpenCode] Using the --key argument (stored key not read)")
-    } else if OpenCodeKeyStore.isConfigured {
-        print("[OpenCode] Key: configured · MD5 fingerprint \(OpenCodeKeyStore.fingerprint?.prefix(8) ?? "?")… "
-              + "· revision \(OpenCodeKeyStore.revision)")
+    } else if AgentKeyStore.openCode.isConfigured {
+        print("[OpenCode] Key: configured · MD5 fingerprint \(AgentKeyStore.openCode.fingerprint?.prefix(8) ?? "?")… "
+              + "· revision \(AgentKeyStore.openCode.revision)")
     } else {
         print("[OpenCode] Key: not configured — set it in Settings → Agents")
     }
 
-    guard let key = overrideKey ?? OpenCodeKeyStore.apiKey() else {
+    guard let key = overrideKey ?? AgentKeyStore.openCode.apiKey() else {
         print("[OpenCode] No key, so no request is made.")
         return
     }
@@ -1025,40 +1046,53 @@ private func runOpenCodeParseCheck() {
 
 /// Verify the encrypt→decrypt round trip and restore whatever was stored before.
 private func runOpenCodeKeySelfTest() {
+    runKeyStoreSelfTest(store: .openCode, label: "OpenCode",
+                        flag: "--opencode-key-selftest")
+}
+
+/// Same round-trip check for the Ollama key slot (independent KDF secret + keys).
+private func runOllamaKeySelfTest() {
+    runKeyStoreSelfTest(store: .ollama, label: "Ollama",
+                        flag: "--ollama-key-selftest")
+}
+
+/// Shared self-test for one agent's encrypted key slot.
+private func runKeyStoreSelfTest(store: AgentKeyStore, label: String, flag: String) {
     let args = CommandLine.arguments
-    guard let candidate = parseStringFlag(args, flag: "--opencode-key-selftest"),
+    guard let candidate = parseStringFlag(args, flag: flag),
           !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     else {
-        print("[OpenCode] usage: --opencode-key-selftest '<temporary key>'")
+        print("[\(label)] usage: \(flag) '<temporary key>'")
         return
     }
 
-    let previousKey = OpenCodeKeyStore.apiKey()
+    let previousKey = store.apiKey()
     defer {
-        // Restore the user's real key, or leave the store unconfigured.
+        // Restore the user's real key, or leave the slot unconfigured.
         if let previousKey {
-            _ = OpenCodeKeyStore.setKey(previousKey)
+            _ = store.setKey(previousKey)
         } else {
-            OpenCodeKeyStore.clear()
+            store.clear()
         }
-        print("[OpenCode] Store restored (configured=\(OpenCodeKeyStore.isConfigured))")
+        print("[\(label)] Store restored (configured=\(store.isConfigured))")
     }
 
     let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-    print("[OpenCode] Round trip for a \(trimmed.count)-character test key")
-    guard OpenCodeKeyStore.setKey(trimmed) else {
-        print("[OpenCode][FAIL] setKey refused the value")
+    print("[\(label)] Round trip for a \(trimmed.count)-character test key")
+    guard store.setKey(trimmed) else {
+        print("[\(label)][FAIL] setKey refused the value")
         return
     }
 
-    let decrypted = OpenCodeKeyStore.apiKey()
+    let decrypted = store.apiKey()
     let expectedFingerprint = Data(Insecure.MD5.hash(data: Data(trimmed.utf8)))
         .map { String(format: "%02x", $0) }.joined()
 
     print("  decrypt    : \(decrypted == trimmed ? "OK" : "MISMATCH")")
-    print("  fingerprint: \(OpenCodeKeyStore.fingerprint == expectedFingerprint ? "OK" : "MISMATCH") "
-          + "(\(OpenCodeKeyStore.fingerprint?.prefix(8) ?? "?")…)")
-    print("  configured : \(OpenCodeKeyStore.isConfigured)")
+    print("  fingerprint: \(store.fingerprint == expectedFingerprint ? "OK" : "MISMATCH") "
+          + "(\(store.fingerprint?.prefix(8) ?? "?")…)")
+    print("  configured : \(store.isConfigured)")
+    print("  revision   : \(store.revision)")
     print("  plaintext on disk: "
           + (storedDefaultsContain(trimmed) ? "FOUND — BUG" : "not found (encrypted)"))
 }
@@ -1070,6 +1104,104 @@ private func storedDefaultsContain(_ needle: String) -> Bool {
     guard let data = FileManager.default.contents(atPath: plistPath) else { return false }
     let haystack = String(decoding: data, as: UTF8.self)
     return haystack.contains(needle) || data.range(of: Data(needle.utf8)) != nil
+}
+
+// MARK: - Ollama Diagnostics
+
+/// Print the stored key's state (never the key itself) and the live snapshot.
+/// `--key` overrides the stored key, so a candidate can be checked before saving.
+private func runOllamaUsageProbe() {
+    let args = CommandLine.arguments
+    let overrideKey = parseStringFlag(args, flag: "--key")
+
+    if overrideKey != nil {
+        print("[Ollama] Using the --key argument (stored key not read)")
+    } else if AgentKeyStore.ollama.isConfigured {
+        print("[Ollama] Key: configured · MD5 fingerprint "
+              + "\(AgentKeyStore.ollama.fingerprint?.prefix(8) ?? "?")… "
+              + "· revision \(AgentKeyStore.ollama.revision)")
+    } else {
+        print("[Ollama] Key: not configured — set it in Settings → Agents")
+    }
+
+    guard let key = overrideKey ?? AgentKeyStore.ollama.apiKey() else {
+        print("[Ollama] No key, so no request is made.")
+        return
+    }
+
+    print("[Ollama] GET https://ollama.com/api/balance + /api/usage?range=24h …")
+    let box = VerdictBox()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        box.set(await OllamaUsageClient.probe(key: key))
+        semaphore.signal()
+    }
+    if semaphore.wait(timeout: .now() + 20) == .timedOut {
+        print("[Ollama] ❌ 请求超时")
+        return
+    }
+    print("[Ollama] \(box.value)")
+}
+
+/// Parse one of the two payloads without touching the network.
+/// Usage: --ollama-parse balance|usage '<json>' | @file.json
+private func runOllamaParseCheck() {
+    let args = CommandLine.arguments
+    guard let selectorIndex = args.firstIndex(of: "--ollama-parse"),
+          selectorIndex + 2 < args.count
+    else {
+        print("[Ollama] usage: --ollama-parse balance|usage '<json>' | @file.json")
+        return
+    }
+    let kind = args[selectorIndex + 1].lowercased()
+    let source = args[selectorIndex + 2]
+
+    let json: String
+    if source.hasPrefix("@") {
+        let path = String(source.dropFirst())
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            print("[Ollama][ERROR] cannot read \(path)")
+            return
+        }
+        json = contents
+    } else {
+        json = source
+    }
+    let data = Data(json.utf8)
+
+    switch kind {
+    case "balance":
+        switch OllamaUsageClient.parseBalance(data) {
+        case .success(let balance):
+            print("[Ollama] balance: \(balance.quotas.count) window(s)")
+            for quota in balance.quotas {
+                let used = quota.usedPercent.map { String(format: "%.0f%%", $0) } ?? "—"
+                let remaining = quota.usedPercent.map { String(format: "%.0f%%", 100 - $0) } ?? "—"
+                let reset = quota.resetsAt.map {
+                    ISO8601DateFormatter().string(from: $0)
+                } ?? "no reset"
+                print("  \(quota.windowLabel): used \(used) · remaining \(remaining)"
+                      + " · reset \(reset)")
+            }
+            let allowance = balance.allowanceUSD.map { String(format: "$%.4f", $0) } ?? "—"
+            let remainingUSD = balance.remainingUSD.map { String(format: "$%.4f", $0) } ?? "—"
+            let purchased = balance.purchasedUSD.map { String(format: "$%.4f", $0) } ?? "—"
+            print("  allowance \(allowance) · remaining \(remainingUSD) · purchased \(purchased)")
+        case .failure(let error):
+            print("[Ollama] balance parse failure: \(error.shortLabel) — \(error.message)")
+        }
+    case "usage":
+        switch OllamaUsageClient.parseUsage(data) {
+        case .success(let totals):
+            let cost = totals.costUSD.map { String(format: "$%.5f", $0) } ?? "—"
+            print("[Ollama] usage totals: \(totals.requestCount) request(s)"
+                  + " · in \(totals.inputTokens) / out \(totals.outputTokens) · cost \(cost)")
+        case .failure(let error):
+            print("[Ollama] usage parse failure: \(error.shortLabel) — \(error.message)")
+        }
+    default:
+        print("[Ollama] first argument must be 'balance' or 'usage', got '\(kind)'")
+    }
 }
 
 // MARK: - Test Image

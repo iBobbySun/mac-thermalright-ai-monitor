@@ -101,7 +101,7 @@ final class OpenCodeUsageClient: @unchecked Sendable {
     private var lastAttemptAt: Date?
     private var lastAttemptSucceeded = false
     private var inFlight = false
-    /// Last `OpenCodeKeyStore.revision` observed; -1 forces the first refresh.
+    /// Last `AgentKeyStore.openCode.revision` observed; -1 forces the first refresh.
     private var observedKeyRevision = -1
 
     private let session: URLSession
@@ -121,7 +121,7 @@ final class OpenCodeUsageClient: @unchecked Sendable {
     /// Snapshot for the renderer. Cheap, lock-protected, never touches the network.
     func state() -> OpenCodeUsageState {
         // Read the key store first: it has its own lock and must not be nested under ours.
-        let configured = OpenCodeKeyStore.isConfigured
+        let configured = AgentKeyStore.openCode.isConfigured
 
         lock.lock()
         defer { lock.unlock() }
@@ -144,9 +144,9 @@ final class OpenCodeUsageClient: @unchecked Sendable {
     /// Task. Throttled to one refresh per 60 s on success and 30 s on failure, with a
     /// single in-flight request. Zero network activity when no key is configured.
     func refreshIfNeeded() {
-        let currentRevision = OpenCodeKeyStore.revision
+        let currentRevision = AgentKeyStore.openCode.revision
 
-        guard let key = OpenCodeKeyStore.apiKey() else {
+        guard let key = AgentKeyStore.openCode.apiKey() else {
             lock.lock()
             cachedQuotas = Self.placeholderQuotas
             lastSuccessAt = nil
@@ -182,7 +182,7 @@ final class OpenCodeUsageClient: @unchecked Sendable {
 
         // A save/clear while this request was in flight invalidates its answer: drop
         // it and let the next tick refresh against the new key.
-        let latestRevision = OpenCodeKeyStore.revision
+        let latestRevision = AgentKeyStore.openCode.revision
 
         withLock {
             inFlight = false

@@ -14,17 +14,17 @@
 
 > 基于 [beret21/MacTR](https://github.com/beret21/MacTR) 改造,核心是一块实时追踪
 > [Claude Code](https://claude.com/claude-code)、[Codex](https://openai.com/codex)
-> 会话以及 [OpenCode Zen](https://opencode.ai) 订阅额度的 **AI Agents** 面板。
+> 会话以及 [OpenCode Zen](https://opencode.ai) / [Ollama](https://ollama.com) 订阅额度的 **AI Agents** 面板。
 
 ## 亮点
 
 ### 🤖 AI Agents 面板
-读取**本地**的 Claude Code / Codex 会话日志(只读),并在配置 API Key 后读取 OpenCode Zen 的订阅额度,同屏显示 1–2 个 agent 的:
+读取**本地**的 Claude Code / Codex 会话日志(只读),并在配置 API Key 后读取 OpenCode Zen 与 Ollama Cloud 的用量,同屏显示 1–2 个 agent 的:
 
 - **当前项目**和**它最后说的话** —— 消息里的 Markdown 表格会被渲染成对齐的表格,而不是原始的 `| … |` 文本。
 - **计划 / 步骤进度** —— `步骤 4/6` 徽章 + 分段进度条,从 Codex 的 `update_plan` 和 Claude 的 `TodoWrite` 解析而来。上一轮已完成的旧计划会自动消失。
-- **今日 Token 用量** —— 总量 + In/Out,用简洁的 `万 / 亿` 格式(OpenCode 用量接口不返回 token,显示 `—`)。
-- **剩余额度** —— Claude(5 小时 / 7 天)与 Codex(5 小时 / 7 天)来自本地会话记录,OpenCode(滚动 / 周 / 月)来自其用量接口;统一显示剩余百分比 + 重置时间。
+- **今日 Token 用量** —— 总量 + In/Out,用简洁的 `万 / 亿` 格式(Ollama 显示近 24 小时窗口;OpenCode 用量接口不返回 token,显示 `—`)。
+- **剩余额度** —— Claude(5 小时 / 7 天)与 Codex(5 小时 / 7 天)来自本地会话记录,OpenCode(滚动 / 周 / 月)来自其用量接口,Ollama(本月额度,或 legacy 套餐的会话 / 周)来自 `/api/balance`;统一显示剩余百分比 + 重置时间。
 - **实时状态** —— agent 工作时该栏**缓慢呼吸**,完成一轮或需要你输入时**闪烁**约 10 秒提醒。
 
 ### 🖥️ 系统面板
@@ -91,19 +91,22 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 "$MACTR_BUILD_DIR/release/MacTR" --gif x.gif --frames 48 --fps 12 --scale 2   # 生成演示 GIF
 "$MACTR_BUILD_DIR/release/MacTR" --benchmark 120 # 测量 LCD 可达帧率
 "$MACTR_BUILD_DIR/release/MacTR" --opencode-usage # 诊断:打印 OpenCode Key 状态与滚动/周/月三个窗口
+"$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # 诊断:打印 Ollama Key 状态与实时额度 / 近24h 用量
+"$MACTR_BUILD_DIR/release/MacTR" --ollama-parse balance|usage @body.json   # 离线校验解析器(不联网)
 ```
 
 同一时刻只能有一个进程占用 USB 设备 —— 用 `--demo` / `--benchmark` 前先停掉正在运行的实例。
 
 ## Agent 数据怎么读取
 
-除了下面这张表里的来源,MacTR 不访问任何网络或 API(本 fork 已移除 Sparkle 自动更新组件)。Claude / Codex 只读取它们本来就写到本地磁盘的会话记录;OpenCode 的额度是**可选**的,只有在设置里填入 API Key 后才会查询。
+除了下面这张表里的来源,MacTR 不访问任何网络或 API(本 fork 已移除 Sparkle 自动更新组件)。Claude / Codex 只读取它们本来就写到本地磁盘的会话记录;OpenCode 与 Ollama 的用量是**可选**的,只有在设置里填入各自的 API Key 后才会查询。
 
 | Agent | 来源 | 解析内容 |
 |---|---|---|
 | Claude Code | `~/.claude/projects/*/*.jsonl` | 助手消息、`usage` token、`TodoWrite` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent 消息、`token_count`、`rate_limits`、`update_plan` |
 | OpenCode | `GET https://opencode.ai/zen/go/v1/usage`(Bearer API Key,可选) | 滚动 / 周 / 月额度百分比与重置时间 |
+| Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h`(Bearer API Key,可选) | 本月额度(或 legacy 会话/周)、近 24h token / 请求数 / 花费 |
 
 Token 总量按本地自然日统计;某个 agent 今天还没跑过时,面板会优雅地显示它上一次会话的上下文。
 
@@ -114,13 +117,26 @@ Token 总量按本地自然日统计;某个 agent 今天还没跑过时,面板�
 3. 配置后仪表盘每 60 秒查询一次额度;查询失败(Key 无效 / 断网 / 接口变更)会在该栏显示原因并自动重试,不影响其它面板。
 4. 该接口只返回"状态 + 百分比 + 重置时间",因此 OpenCode 栏的「今日 Token」显示 `—`。清除 Key 后不再有任何网络请求。
 
+### Ollama 用量(可选)
+
+1. 在 [ollama.com/settings/keys](https://ollama.com/settings/keys) 生成 API Key,打开 **设置 → Agents**,粘贴到 Ollama 一栏,点「保存并测试」。
+2. 加密方式与 OpenCode 完全一致(独立的随机 secret + salt → MD5 派生密钥 → AES-GCM),界面只显示 MD5 指纹前 8 位;清除后立即停止轮询。
+3. 每 60 秒并发请求 `/api/balance` 与 `/api/usage?range=24h`(共 2 次/分钟,远低于官方 10 次/分钟的限流),遇到 429 会按 `Retry-After` 自动退避。
+4. 额度按套餐形态自动适配:新的 credits 套餐显示「额度 剩余 %」(由 `balance_usd / allowance_usd` 换算)+ 本期重置时间;legacy 套餐显示「会话 / 周」两条。已购余额与近 24h 花费显示在活动行。
+5. Token 统计口径是**近 24 小时**(接口只提供滚动窗口),所以该栏标题显示「近24h Token」而不是「今日 Token」。
+
 ### 仪表盘显示哪些 Agent
 
-**设置 → Agents** 里勾选 Claude / Codex / OpenCode,**最多同时显示 2 个**(已选满 2 个时其余选项会被禁用);布局方向仍在 **设置 → Display** 里切换。
+**设置 → Agents** 里勾选 Claude / Codex / OpenCode / Ollama,**最多同时显示 2 个**(已选满 2 个时其余选项会被禁用);布局方向仍在 **设置 → Display** 里切换。
 
 ## 隐私
 
-除可选的 OpenCode 用量查询外,一切都在本地、只读:无遥测、无第三方网络请求。唯一的外发请求是你配置 OpenCode API Key 之后,每 60 秒一次 `GET https://opencode.ai/zen/go/v1/usage`,只把该 Key 放进 `Authorization: Bearer` 头,不发送任何本机数据;不配置 Key 就完全没有网络请求。Key 只保存在本机(加密方式见上文)。
+除可选的 OpenCode / Ollama 用量查询外,一切都在本地、只读:无遥测、无第三方网络请求。外发请求只有两种,且各自以对应 agent 的 Key 作为 `Authorization: Bearer` 头,不发送任何本机数据:
+
+- 配置 OpenCode Key 后,每 60 秒一次 `GET https://opencode.ai/zen/go/v1/usage`;
+- 配置 Ollama Key 后,每 60 秒一次 `GET https://ollama.com/api/balance` 与一次 `GET https://ollama.com/api/usage?range=24h`。
+
+不配置 Key 就完全没有对应的网络请求。Key 只保存在本机(加密方式见上文)。
 
 ## 致谢
 

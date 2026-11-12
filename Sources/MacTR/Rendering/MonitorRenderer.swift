@@ -201,6 +201,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         return (visibleAgents.contains(.claude) && (a.claude.isWorking || a.claude.needsAttention))
             || (visibleAgents.contains(.codex) && (a.codex.isWorking || a.codex.needsAttention))
             || (visibleAgents.contains(.opencode) && (a.opencode.isWorking || a.opencode.needsAttention))
+            || (visibleAgents.contains(.ollama) && (a.ollama.isWorking || a.ollama.needsAttention))
     }
 
     private func metricsLoop(generation: UInt64) {
@@ -333,7 +334,18 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                                                 resetIsEstimated: false,
                                                 windowLabel: "月"),
                                  ],
-                                 tokensAvailable: false))
+                                 tokensAvailable: false),
+            ollama: AgentUsage(available: true,
+                               todayInputTokens: 1_240_000, todayOutputTokens: 86_000,
+                               secondsSinceActive: 8, project: "Ollama Cloud",
+                               activity: "近24h $0.2418 · 42 次请求 · 已购余额 $25.00",
+                               quotas: [
+                                   AgentQuota(usedPercent: 23,
+                                              resetsAt: Date().addingTimeInterval(9 * 24 * 3600),
+                                              resetIsEstimated: false,
+                                              windowLabel: "额度"),
+                               ],
+                               tokenWindowCaption: "近24h Token"))
         return (cpu, mem, temp, sys, agents)
     }
 
@@ -412,7 +424,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         if let until = testFlashUntil, Date() < until {
             agents = AgentsSnapshot(claude: withAttention(agents.claude),
                                     codex: withAttention(agents.codex),
-                                    opencode: withAttention(agents.opencode))
+                                    opencode: withAttention(agents.opencode),
+                                    ollama: withAttention(agents.ollama))
         }
 
         // Reuse CGContext to prevent CG raster data memory growth
@@ -738,6 +751,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             return ("CODEX", Color.cyan, agents.codex)
         case .opencode:
             return ("OPENCODE", Color.opencode, agents.opencode)
+        case .ollama:
+            return ("OLLAMA", Color.ollama, agents.ollama)
         }
     }
 
@@ -854,7 +869,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
         Draw.line(ctx, from: CGPoint(x: innerX, y: tokenY - 8),
                   to: CGPoint(x: innerX + innerW, y: tokenY - 8), color: Color.border)
-        Draw.text(ctx, "今日 Token", x: innerX, y: tokenY,
+        Draw.text(ctx, usage.tokenWindowCaption ?? "今日 Token", x: innerX, y: tokenY,
                   font: Fonts.system(15), color: Color.textL)
         Draw.text(ctx, usage.tokensAvailable ? formatTokensCN(usage.todayTotalTokens) : "—",
                   x: innerX, y: tokenY + 18,
@@ -1003,7 +1018,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let tokY = py + ph - 126 - extraQuotaHeight
         Draw.line(ctx, from: CGPoint(x: x, y: tokY - 12),
                   to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
-        Draw.text(ctx, "今日 Token", x: x, y: tokY,
+        Draw.text(ctx, usage.tokenWindowCaption ?? "今日 Token", x: x, y: tokY,
                   font: Fonts.system(19), color: Color.textL)
         Draw.text(ctx, usage.tokensAvailable ? formatTokensCN(usage.todayTotalTokens) : "—",
                   x: x, y: tokY + 24,

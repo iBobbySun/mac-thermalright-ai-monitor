@@ -41,10 +41,16 @@ final class AppState {
     var agentLayoutDirection: AgentLayoutDirection
 
     // OpenCode API key (Settings → Agents). Only the fingerprint is ever surfaced.
-    var openCodeKeyConfigured: Bool = OpenCodeKeyStore.isConfigured
-    var openCodeKeyFingerprint: String? = OpenCodeKeyStore.fingerprint
+    var openCodeKeyConfigured: Bool = AgentKeyStore.openCode.isConfigured
+    var openCodeKeyFingerprint: String? = AgentKeyStore.openCode.fingerprint
     var openCodeKeyStatus: String = ""
     var openCodeKeyTesting: Bool = false
+
+    // Ollama API key (Settings → Agents). Same storage and UX as OpenCode.
+    var ollamaKeyConfigured: Bool = AgentKeyStore.ollama.isConfigured
+    var ollamaKeyFingerprint: String? = AgentKeyStore.ollama.fingerprint
+    var ollamaKeyStatus: String = ""
+    var ollamaKeyTesting: Bool = false
 
     // Metrics (for menu bar display)
     var frameCount = 0
@@ -145,7 +151,7 @@ final class AppState {
         agentLayoutDirection = normalized.layoutDirection
     }
 
-    // MARK: - OpenCode API key
+    // MARK: - Agent display selection
 
     /// True when `agent` may be checked in Settings right now.
     func canSelectAgent(_ agent: AgentKind) -> Bool {
@@ -168,18 +174,22 @@ final class AppState {
         applySettings()
     }
 
+    // MARK: - OpenCode API key
+
     private func refreshOpenCodeKeyState() {
-        openCodeKeyConfigured = OpenCodeKeyStore.isConfigured
-        openCodeKeyFingerprint = OpenCodeKeyStore.fingerprint
+        openCodeKeyConfigured = AgentKeyStore.openCode.isConfigured
+        openCodeKeyFingerprint = AgentKeyStore.openCode.fingerprint
     }
 
     /// Verify the candidate key against OpenCode, then store it encrypted.
     /// A rejected key is not saved, so a typo cannot break a working configuration.
-    func saveAndTestOpenCodeKey(_ raw: String) async {
+    /// Returns true when the key was verified AND stored.
+    @discardableResult
+    func saveAndTestOpenCodeKey(_ raw: String) async -> Bool {
         let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !typed.isEmpty else {
             openCodeKeyStatus = "❌ 请输入 API Key"
-            return
+            return false
         }
         openCodeKeyTesting = true
         openCodeKeyStatus = "正在验证…"
@@ -187,20 +197,60 @@ final class AppState {
         openCodeKeyTesting = false
         openCodeKeyStatus = verdict
 
-        guard verdict.hasPrefix("✅") else { return }
-        guard OpenCodeKeyStore.setKey(typed) else {
+        guard verdict.hasPrefix("✅") else { return false }
+        guard AgentKeyStore.openCode.setKey(typed) else {
             openCodeKeyStatus = "❌ 本地加密保存失败"
-            return
+            return false
         }
         refreshOpenCodeKeyState()
         // The collector notices the revision bump on its next tick (≤2 s) and refreshes.
         openCodeKeyStatus = verdict + " · 已加密保存"
+        return true
     }
 
     func clearOpenCodeKey() {
-        OpenCodeKeyStore.clear()
+        AgentKeyStore.openCode.clear()
         refreshOpenCodeKeyState()
         openCodeKeyStatus = "已清除 API Key"
+    }
+
+    // MARK: - Ollama API key
+
+    private func refreshOllamaKeyState() {
+        ollamaKeyConfigured = AgentKeyStore.ollama.isConfigured
+        ollamaKeyFingerprint = AgentKeyStore.ollama.fingerprint
+    }
+
+    /// Verify the candidate key against ollama.com, then store it encrypted.
+    /// Both endpoints are probed (balance + usage), so a key that only half works
+    /// is still accepted but the verdict says which half answered.
+    @discardableResult
+    func saveAndTestOllamaKey(_ raw: String) async -> Bool {
+        let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty else {
+            ollamaKeyStatus = "❌ 请输入 API Key"
+            return false
+        }
+        ollamaKeyTesting = true
+        ollamaKeyStatus = "正在验证…"
+        let verdict = await OllamaUsageClient.probe(key: typed)
+        ollamaKeyTesting = false
+        ollamaKeyStatus = verdict
+
+        guard verdict.hasPrefix("✅") else { return false }
+        guard AgentKeyStore.ollama.setKey(typed) else {
+            ollamaKeyStatus = "❌ 本地加密保存失败"
+            return false
+        }
+        refreshOllamaKeyState()
+        ollamaKeyStatus = verdict + " · 已加密保存"
+        return true
+    }
+
+    func clearOllamaKey() {
+        AgentKeyStore.ollama.clear()
+        refreshOllamaKeyState()
+        ollamaKeyStatus = "已清除 API Key"
     }
 }
 

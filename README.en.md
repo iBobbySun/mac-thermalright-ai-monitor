@@ -18,23 +18,24 @@ Pikachu hops and crackles with CPU load, clock ticks.</sub>
 > Fork of [beret21/MacTR](https://github.com/beret21/MacTR), reworked around a central
 > **AI Agents** panel that tracks [Claude Code](https://claude.com/claude-code) and
 > [Codex](https://openai.com/codex) sessions in real time, plus
-> [OpenCode Zen](https://opencode.ai) subscription quota.
+> [OpenCode Zen](https://opencode.ai) / [Ollama](https://ollama.com) subscription usage.
 
 ## Highlights
 
 ### 🤖 AI Agents panel
 Reads your **local** Claude Code and Codex session logs (read-only) and — once an API key is
-configured — the OpenCode Zen usage endpoint. Shows 1–2 agents at a time:
+configured — the OpenCode Zen and Ollama Cloud usage endpoints. Shows 1–2 agents at a time:
 
 - **Current project** and the **last thing it said** — Markdown tables in the message are
   rendered as real aligned tables, not raw `| … |` text.
 - **Plan / step progress** — `步骤 4/6` badge + a segmented progress bar, parsed from
   Codex `update_plan` and Claude `TodoWrite`. Stale plans from a finished turn disappear.
-- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (the OpenCode
-  usage API reports no token counts, so that column shows `—`).
+- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (Ollama shows a
+  trailing 24 h window; the OpenCode usage API reports no token counts, so that column shows `—`).
 - **Remaining quota** — Claude (5-hour / 7-day) and Codex (5-hour / 7-day) from local
-  transcripts, OpenCode (rolling / weekly / monthly) from its usage API; each with the
-  remaining % and reset time.
+  transcripts, OpenCode (rolling / weekly / monthly) from its usage API, Ollama (monthly
+  credits, or session / weekly on legacy plans) from `/api/balance`; each with the remaining
+  % and reset time.
 - **Live status** — the column **breathes** while an agent is working and **flashes** for
   ~10 s when it finishes a turn or needs your input.
 
@@ -107,6 +108,8 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 "$MACTR_BUILD_DIR/release/MacTR" --gif x.gif --frames 48 --fps 12 --scale 2   # animated demo GIF
 "$MACTR_BUILD_DIR/release/MacTR" --benchmark 120 # measure achievable LCD frame rate
 "$MACTR_BUILD_DIR/release/MacTR" --opencode-usage # diagnostics: OpenCode key status + rolling/weekly/monthly windows
+"$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # diagnostics: Ollama key status + live quota / last-24h usage
+"$MACTR_BUILD_DIR/release/MacTR" --ollama-parse balance|usage @body.json   # offline parser check (no network)
 ```
 
 Only one process can hold the USB device at a time — stop the running instance before
@@ -116,14 +119,15 @@ using `--demo` / `--benchmark`.
 
 Apart from the sources below, MacTR does not talk to any network or API. This fork removes
 the Sparkle auto-updater; Claude / Codex only read the local transcripts those CLIs already
-write to disk, and the OpenCode quota is **optional** — it is only queried after you enter an
-API key in Settings.
+write to disk, and the OpenCode / Ollama usage is **optional** — each is only queried after
+you enter its API key in Settings.
 
 | Agent | Source | What's parsed |
 |---|---|---|
 | Claude Code | `~/.claude/projects/*/*.jsonl` | assistant messages, `usage` tokens, `TodoWrite` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent messages, `token_count`, `rate_limits`, `update_plan` |
 | OpenCode | `GET https://opencode.ai/zen/go/v1/usage` (Bearer API key, optional) | rolling / weekly / monthly usage % and reset times |
+| Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h` (Bearer API key, optional) | monthly credits (or legacy session/weekly), last-24h tokens / requests / spend |
 
 Token totals are scoped to the local day; the panel gracefully shows the last session's
 context when an agent hasn't run yet today.
@@ -142,19 +146,38 @@ context when an agent hasn't run yet today.
 4. The endpoint only returns status + percentage + reset time, so OpenCode's "Today token"
    field shows `—`. Clearing the key removes all network traffic.
 
+### Ollama usage (optional)
+
+1. Create an API key at [ollama.com/settings/keys](https://ollama.com/settings/keys), open
+   **Settings → Agents**, paste it into the Ollama field and click "Save & Test".
+2. Same encryption as the OpenCode key (independent random secret + salt → MD5-derived key →
+   AES-GCM); the UI only shows the first 8 hex chars of the MD5 fingerprint.
+3. Every 60 s the dashboard requests `/api/balance` and `/api/usage?range=24h` (2 of the
+   official 10 requests/minute limit); a 429 is honoured via `Retry-After` with backoff.
+4. The quota row adapts to the plan: credit plans show "额度 剩余 %" (from
+   `balance_usd / allowance_usd`) plus the period reset; legacy plans show session / weekly.
+   Purchased balance and last-24h spend appear in the activity line.
+5. Tokens are a **trailing 24 h** window (the only window the API offers), so the caption reads
+   "近24h Token" instead of "Today token".
+
 ### Which agents the dashboard shows
 
-Tick Claude / Codex / OpenCode in **Settings → Agents** — **at most 2 are shown at once**
+Tick Claude / Codex / OpenCode / Ollama in **Settings → Agents** — **at most 2 are shown at once**
 (the remaining toggles are disabled once two are selected). Orientation still lives in
 **Settings → Display**.
 
 ## Privacy
 
-Apart from the optional OpenCode quota lookup, everything is local and read-only: no
-telemetry, no third-party network calls. The only outbound request — made only after you
-configure an OpenCode API key — is `GET https://opencode.ai/zen/go/v1/usage` once every 60 s,
-carrying that key as an `Authorization: Bearer` header and no local data at all. Without a key,
-there is no network traffic. The key is stored only on this Mac (see the encryption above).
+Apart from the optional OpenCode / Ollama lookups, everything is local and read-only: no
+telemetry, no third-party network calls. There are exactly two kinds of outbound request, each
+carrying only its own key as an `Authorization: Bearer` header and no local data at all:
+
+- with an OpenCode key configured, `GET https://opencode.ai/zen/go/v1/usage` once every 60 s;
+- with an Ollama key configured, `GET https://ollama.com/api/balance` and
+  `GET https://ollama.com/api/usage?range=24h` once every 60 s.
+
+Without the corresponding key there is no network traffic. Keys are stored only on this Mac
+(see the encryption above).
 
 ## Credits
 

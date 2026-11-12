@@ -36,6 +36,9 @@ struct AgentUsage: Sendable {
     let stepText: String?           // description of the active step
     let tokensAvailable: Bool       // false = the source exposes no token counts (OpenCode API)
     let statusLabel: String?        // overrides the right-aligned "now / 12m ago / not found" text
+    /// Replaces the hardcoded "今日 Token" caption when the token counters do not
+    /// cover a calendar day (Ollama reports a trailing 24 h window).
+    let tokenWindowCaption: String?
     var todayTotalTokens: UInt64 { todayInputTokens + todayOutputTokens }
 
     init(available: Bool, todayInputTokens: UInt64, todayOutputTokens: UInt64,
@@ -43,7 +46,8 @@ struct AgentUsage: Sendable {
          quotas: [AgentQuota] = [],
          needsAttention: Bool = false, isWorking: Bool = false,
          stepCurrent: Int? = nil, stepTotal: Int? = nil, stepText: String? = nil,
-         tokensAvailable: Bool = true, statusLabel: String? = nil) {
+         tokensAvailable: Bool = true, statusLabel: String? = nil,
+         tokenWindowCaption: String? = nil) {
         self.available = available
         self.todayInputTokens = todayInputTokens
         self.todayOutputTokens = todayOutputTokens
@@ -58,6 +62,7 @@ struct AgentUsage: Sendable {
         self.stepText = stepText
         self.tokensAvailable = tokensAvailable
         self.statusLabel = statusLabel
+        self.tokenWindowCaption = tokenWindowCaption
     }
 }
 
@@ -65,6 +70,7 @@ struct AgentsSnapshot: Sendable {
     let claude: AgentUsage
     let codex: AgentUsage
     let opencode: AgentUsage
+    let ollama: AgentUsage
 }
 
 // MARK: - Collector
@@ -80,6 +86,9 @@ final class AgentUsageCollector: @unchecked Sendable {
     /// API-backed quota source for OpenCode Zen (no local transcripts to read).
     /// The client does its own throttling and never blocks this collector's thread.
     private let openCodeClient = OpenCodeUsageClient()
+
+    /// API-backed usage source for Ollama Cloud (remote only, like OpenCode).
+    private let ollamaClient = OllamaUsageClient()
 
     private lazy var localDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -207,7 +216,7 @@ final class AgentUsageCollector: @unchecked Sendable {
     func collect() -> AgentsSnapshot {
         rolloverIfNeeded()
         return AgentsSnapshot(claude: collectClaude(), codex: collectCodex(),
-                              opencode: collectOpenCode())
+                              opencode: collectOpenCode(), ollama: collectOllama())
     }
 
     /// Reset accumulators at local midnight. Timestamps in both formats are
@@ -778,6 +787,99 @@ final class AgentUsageCollector: @unchecked Sendable {
             quotas: state.quotas,
             tokensAvailable: false,
             statusLabel: nil)
+    }
+
+    // MARK: - Ollama (API-backed)
+
+    /// Ollama Cloud exposes remaining credits over HTTPS (`/api/balance`) plus
+    /// trailing-24h totals (`/api/usage?range=24h`). The client refreshes itself in
+    /// the background (60 s on success / 30 s on failure / 429 backoff), so this
+    /// method only pays for a lock-guarded snapshot read.
+    ///
+    /// Status slot semantics match OpenCode:
+    ///   unconfigured      → 未配置
+    ///   configured, first → 同步中
+    ///   success           → nil (renderer shows "now" / "Xm ago" from secondsSinceActive)
+    ///   failure           → error.shortLabel, last known numbers kept
+    private func collectOllama() -> AgentUsage {
+        ollamaClient.refreshIfNeeded()
+        let state = ollamaClient.state()
+        let age = state.lastSuccessAt.map { max(0, Int(Date().timeIntervalSince($0))) }
+        let caption = "近24h Token"
+
+        guard state.isConfigured else {
+            return AgentUsage(
+                available: false, todayInputTokens: 0, todayOutputTokens: 0,
+                secondsSinceActive: nil, project: "Ollama Cloud",
+                activity: "在 设置 → Agents 中填入 Ollama API Key",
+                quotas: OllamaUsageClient.placeholderQuotas,
+                tokensAvailable: false,
+                statusLabel: "未配置",
+                tokenWindowCaption: caption)
+        }
+
+        if let error = state.lastError {
+            // Keep the last known-good numbers (same policy as OpenCode); the status
+            // slot and the activity line explain that they are stale.
+            let snapshot = state.snapshot
+            return AgentUsage(
+                available: true, todayInputTokens: snapshot.inputTokens,
+                todayOutputTokens: snapshot.outputTokens,
+                secondsSinceActive: age, project: "Ollama Cloud",
+                activity: "刷新失败：\(error.message)（将自动重试）",
+                quotas: snapshot.quotas,
+                tokensAvailable: snapshot.tokensAvailable,
+                statusLabel: error.shortLabel,
+                tokenWindowCaption: caption)
+        }
+
+        // Configured but the first response hasn't landed yet.
+        guard state.lastSuccessAt != nil else {
+            return AgentUsage(
+                available: true, todayInputTokens: 0, todayOutputTokens: 0,
+                secondsSinceActive: nil, project: "Ollama Cloud",
+                activity: "正在获取 Ollama 用量…",
+                quotas: OllamaUsageClient.placeholderQuotas,
+                tokensAvailable: false,
+                statusLabel: "同步中",
+                tokenWindowCaption: caption)
+        }
+
+        let snapshot = state.snapshot
+        return AgentUsage(
+            available: true, todayInputTokens: snapshot.inputTokens,
+            todayOutputTokens: snapshot.outputTokens,
+            secondsSinceActive: age, project: "Ollama Cloud",
+            activity: ollamaActivity(snapshot),
+            quotas: snapshot.quotas,
+            tokensAvailable: snapshot.tokensAvailable,
+            statusLabel: nil,
+            tokenWindowCaption: caption)
+    }
+
+    /// Compact activity line: 24 h spend, request count, purchased balance, and a
+    /// note when only one of the two endpoints answered.
+    private func ollamaActivity(_ snapshot: OllamaUsageSnapshot) -> String {
+        var parts: [String] = []
+        if snapshot.tokensAvailable {
+            if let cost = snapshot.costUSD {
+                if cost > 0 {
+                    parts.append(cost < 1
+                                 ? String(format: "近24h $%.4f", cost)
+                                 : String(format: "近24h $%.2f", cost))
+                } else {
+                    parts.append("近24h 无花费")
+                }
+            }
+            parts.append("\(snapshot.requestCount) 次请求")
+        }
+        if let purchased = snapshot.purchasedUSD, purchased > 0 {
+            parts.append(String(format: "已购余额 $%.2f", purchased))
+        }
+        if let partial = snapshot.partialFailure {
+            parts.append("额度接口异常（\(partial.shortLabel)）")
+        }
+        return parts.isEmpty ? "额度实时同步 · 每 60 秒刷新" : parts.joined(separator: " · ")
     }
 
     // MARK: - Codex
