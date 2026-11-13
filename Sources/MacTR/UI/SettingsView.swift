@@ -33,7 +33,7 @@ struct SettingsView: View {
                 aboutView
             }
         }
-        .frame(width: 500, height: 680)
+        .frame(width: 500, height: 800)
     }
 
     // MARK: - General Tab

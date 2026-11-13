@@ -202,6 +202,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             || (visibleAgents.contains(.codex) && (a.codex.isWorking || a.codex.needsAttention))
             || (visibleAgents.contains(.opencode) && (a.opencode.isWorking || a.opencode.needsAttention))
             || (visibleAgents.contains(.ollama) && (a.ollama.isWorking || a.ollama.needsAttention))
+            || (visibleAgents.contains(.antigravity) && (a.antigravity.isWorking || a.antigravity.needsAttention))
     }
 
     private func metricsLoop(generation: UInt64) {
@@ -345,7 +346,34 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                                               resetIsEstimated: false,
                                               windowLabel: "额度"),
                                ],
-                               tokenWindowCaption: "近24h Token"))
+                               tokenWindowCaption: "近24h Token"),
+            antigravity: AgentUsage(available: true,
+                                    todayInputTokens: 0, todayOutputTokens: 0,
+                                    secondsSinceActive: 4, project: "Antigravity",
+                                    activity: "Gemini · Claude/GPT · Argon · 本地实时读取",
+                                    quotas: [
+                                        AgentQuota(usedPercent: 46,
+                                                   resetsAt: Date().addingTimeInterval(2 * 3600),
+                                                   resetIsEstimated: false,
+                                                   windowLabel: "Gemini 5小时"),
+                                        AgentQuota(usedPercent: 21,
+                                                   resetsAt: Date().addingTimeInterval(6 * 24 * 3600),
+                                                   resetIsEstimated: false,
+                                                   windowLabel: "Gemini 周"),
+                                        AgentQuota(usedPercent: 12,
+                                                   resetsAt: Date().addingTimeInterval(2 * 3600),
+                                                   resetIsEstimated: false,
+                                                   windowLabel: "Claude/GPT 5小时"),
+                                        AgentQuota(usedPercent: 8,
+                                                   resetsAt: Date().addingTimeInterval(6 * 24 * 3600),
+                                                   resetIsEstimated: false,
+                                                   windowLabel: "Claude/GPT 周"),
+                                        AgentQuota(usedPercent: 17,
+                                                   resetsAt: Date().addingTimeInterval(6 * 24 * 3600),
+                                                   resetIsEstimated: false,
+                                                   windowLabel: "Argon 周"),
+                                    ],
+                                    tokensAvailable: false))
         return (cpu, mem, temp, sys, agents)
     }
 
@@ -425,7 +453,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             agents = AgentsSnapshot(claude: withAttention(agents.claude),
                                     codex: withAttention(agents.codex),
                                     opencode: withAttention(agents.opencode),
-                                    ollama: withAttention(agents.ollama))
+                                    ollama: withAttention(agents.ollama),
+                                    antigravity: withAttention(agents.antigravity))
         }
 
         // Reuse CGContext to prevent CG raster data memory growth
@@ -753,6 +782,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             return ("OPENCODE", Color.opencode, agents.opencode)
         case .ollama:
             return ("OLLAMA", Color.ollama, agents.ollama)
+        case .antigravity:
+            return ("ANTIGRAVITY", Color.antigravity, agents.antigravity)
         }
     }
 
@@ -836,6 +867,31 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         // need the whole card for quota rows, so the token / In-Out / message blocks
         // are omitted and the rows are bottom-aligned inside the card.
         if !usage.tokensAvailable || quotas.count >= 3 {
+            // Four or more windows (Antigravity shows five) need tighter metrics than
+            // the three-window layout: a 189 pt card only has ~110 pt below the header.
+            if quotas.count >= 4 {
+                let denseStride = 22
+                let denseBarOffset = 17
+                let denseBarHeight = 3
+                let labelFont = Fonts.system(13, weight: .semibold)
+                let resetFont = Fonts.system(10.5)
+                let firstRowY = cy + 2
+                for (index, quota) in quotas.enumerated() {
+                    let rowY = firstRowY + index * denseStride
+                    Draw.text(ctx, quota.remainingText, x: innerX, y: rowY,
+                              font: labelFont, color: quota.color)
+                    let resetW = (quota.resetText as NSString)
+                        .size(withAttributes: [.font: resetFont]).width
+                    Draw.text(ctx, quota.resetText,
+                              x: Int(CGFloat(innerX + innerW) - resetW), y: rowY + 1,
+                              font: resetFont,
+                              color: quota.hasReset ? Color.textS : Color.textD)
+                    Draw.bar(ctx, x: innerX, y: rowY + denseBarOffset, w: innerW,
+                             h: denseBarHeight, percent: quota.remaining ?? 0, color: quota.color)
+                }
+                return
+            }
+
             let quotaStride = 32
             let barOffset = 25
             let barHeight = 5
@@ -843,6 +899,13 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             // Last bar's bottom edge sits `bottomInset` above the card bottom.
             let firstQuotaY = y + h - bottomInset - barHeight - barOffset
                 - (quotas.count - 1) * quotaStride
+            // With at most two rows there is room above them for the activity line.
+            // Antigravity uses it for the model groups that are not on the card.
+            if quotas.count <= 2 {
+                renderMessage(ctx, text: usage.activity ?? (usage.available ? "空闲" : "—"),
+                              x: innerX, y: cy, w: innerW,
+                              bottom: firstQuotaY - 6, accent: accent)
+            }
             for (index, quota) in quotas.enumerated() {
                 let quotaY = firstQuotaY + index * quotaStride
                 Draw.text(ctx, quota.remainingText, x: innerX, y: quotaY,
@@ -1011,40 +1074,53 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let quotas = quotaPresentations(usage)
         let extraQuotaHeight = max(0, quotas.count - 1) * 40
         let actText = usage.activity ?? (usage.available ? "空闲" : "—")
-        let msgBottom = py + ph - 140 - extraQuotaHeight
-        renderMessage(ctx, text: actText, x: x, y: y, w: w, bottom: msgBottom, accent: accent)
 
-        // Token usage — large, anchored near the bottom of the column
-        let tokY = py + ph - 126 - extraQuotaHeight
-        Draw.line(ctx, from: CGPoint(x: x, y: tokY - 12),
-                  to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
-        Draw.text(ctx, usage.tokenWindowCaption ?? "今日 Token", x: x, y: tokY,
-                  font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, usage.tokensAvailable ? formatTokensCN(usage.todayTotalTokens) : "—",
-                  x: x, y: tokY + 24,
-                  font: Fonts.system(46, weight: .bold), color: Color.textW)
+        // Quota rows stay bottom-anchored: the last row's bar ends 12 pt above the
+        // card bottom. Token-bearing agents draw the token block above them.
+        let firstQuotaY: Int
+        if usage.tokensAvailable {
+            let msgBottom = py + ph - 140 - extraQuotaHeight
+            renderMessage(ctx, text: actText, x: x, y: y, w: w, bottom: msgBottom, accent: accent)
 
-        // In / Out — right-aligned, level with the label + big number
-        let ioFont = Fonts.system(20, weight: .medium)
-        let ioRows: [(String, UInt64)] = [
-            ("In", usage.todayInputTokens),
-            ("Out", usage.todayOutputTokens),
-        ]
-        for (i, row) in ioRows.enumerated() {
-            let ry = tokY + 6 + i * 30
-            let valStr = usage.tokensAvailable ? formatTokensCN(row.1) : "—"
-            let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
-            Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
-                      font: ioFont, color: Color.textS)
-            let labelW = (row.0 as NSString).size(withAttributes: [.font: ioFont]).width
-            Draw.text(ctx, row.0, x: Int(CGFloat(x + w) - valW - labelW - 10), y: ry,
-                      font: ioFont, color: Color.textL)
+            // Token usage — large, anchored near the bottom of the column
+            let tokY = py + ph - 126 - extraQuotaHeight
+            Draw.line(ctx, from: CGPoint(x: x, y: tokY - 12),
+                      to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
+            Draw.text(ctx, usage.tokenWindowCaption ?? "今日 Token", x: x, y: tokY,
+                      font: Fonts.system(19), color: Color.textL)
+            Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
+                      font: Fonts.system(46, weight: .bold), color: Color.textW)
+
+            // In / Out — right-aligned, level with the label + big number
+            let ioFont = Fonts.system(20, weight: .medium)
+            let ioRows: [(String, UInt64)] = [
+                ("In", usage.todayInputTokens),
+                ("Out", usage.todayOutputTokens),
+            ]
+            for (i, row) in ioRows.enumerated() {
+                let ry = tokY + 6 + i * 30
+                let valStr = formatTokensCN(row.1)
+                let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
+                Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
+                          font: ioFont, color: Color.textS)
+                let labelW = (row.0 as NSString).size(withAttributes: [.font: ioFont]).width
+                Draw.text(ctx, row.0, x: Int(CGFloat(x + w) - valW - labelW - 10), y: ry,
+                          font: ioFont, color: Color.textL)
+            }
+            firstQuotaY = tokY + 78
+        } else {
+            // Token-less sources (OpenCode / Antigravity) used to reserve an empty
+            // "—" block; the activity line gets that room instead. Row positions stay
+            // identical to the token path so switching agents never shifts the card.
+            firstQuotaY = py + ph - 48 - (quotas.count - 1) * 40
+            renderMessage(ctx, text: actText, x: x, y: y, w: w,
+                          bottom: firstQuotaY - 16, accent: accent)
         }
 
-        // Quota rows are anchored at the bottom. Both agents reserve 5-hour and
-        // 7-day entries; an unavailable plan window stays visible as "--".
+        // Quota rows are anchored at the bottom. Every agent reserves its windows;
+        // an unavailable plan window stays visible as "--".
         for (index, quota) in quotas.enumerated() {
-            let qy = tokY + 78 + index * 40
+            let qy = firstQuotaY + index * 40
             Draw.text(ctx, quota.remainingText, x: x, y: qy,
                       font: Fonts.system(21, weight: .medium), color: quota.color)
             let resetFont = Fonts.system(17)

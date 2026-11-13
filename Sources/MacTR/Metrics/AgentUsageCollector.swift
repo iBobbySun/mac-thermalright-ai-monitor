@@ -71,6 +71,7 @@ struct AgentsSnapshot: Sendable {
     let codex: AgentUsage
     let opencode: AgentUsage
     let ollama: AgentUsage
+    let antigravity: AgentUsage
 }
 
 // MARK: - Collector
@@ -89,6 +90,9 @@ final class AgentUsageCollector: @unchecked Sendable {
 
     /// API-backed usage source for Ollama Cloud (remote only, like OpenCode).
     private let ollamaClient = OllamaUsageClient()
+
+    /// Local-only quota source for Antigravity (talks to its bundled language server).
+    private let antigravityClient = AntigravityUsageClient()
 
     private lazy var localDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -216,7 +220,8 @@ final class AgentUsageCollector: @unchecked Sendable {
     func collect() -> AgentsSnapshot {
         rolloverIfNeeded()
         return AgentsSnapshot(claude: collectClaude(), codex: collectCodex(),
-                              opencode: collectOpenCode(), ollama: collectOllama())
+                              opencode: collectOpenCode(), ollama: collectOllama(),
+                              antigravity: collectAntigravity())
     }
 
     /// Reset accumulators at local midnight. Timestamps in both formats are
@@ -880,6 +885,49 @@ final class AgentUsageCollector: @unchecked Sendable {
             parts.append("额度接口异常（\(partial.shortLabel)）")
         }
         return parts.isEmpty ? "额度实时同步 · 每 60 秒刷新" : parts.joined(separator: " · ")
+    }
+
+    // MARK: - Antigravity (local language server)
+
+    /// Antigravity reports Pro-plan limits per model group (5-hour + weekly). The
+    /// client discovers the running IDE's language server and reads the quota from
+    /// it over loopback — no key, no OAuth token, nothing leaves the machine.
+    ///
+    /// The card shows the Gemini group's two windows; the other groups go into the
+    /// activity line. Status slot: 未运行 / 未连接 / 同步中 / nil.
+    private func collectAntigravity() -> AgentUsage {
+        antigravityClient.refreshIfNeeded()
+        let state = antigravityClient.state()
+        let age = state.lastSuccessAt.map { max(0, Int(Date().timeIntervalSince($0))) }
+
+        if let error = state.lastError {
+            return AgentUsage(
+                available: state.lastSuccessAt != nil,
+                todayInputTokens: 0, todayOutputTokens: 0,
+                secondsSinceActive: age, project: "Antigravity",
+                activity: "刷新失败：\(error.message)（\(error == .notRunning ? "启动后自动恢复" : "将自动重试")）",
+                quotas: state.quotas,
+                tokensAvailable: false,
+                statusLabel: error.shortLabel)
+        }
+
+        guard state.lastSuccessAt != nil else {
+            return AgentUsage(
+                available: false, todayInputTokens: 0, todayOutputTokens: 0,
+                secondsSinceActive: nil, project: "Antigravity",
+                activity: "正在读取 Antigravity 额度…",
+                quotas: AntigravityUsageClient.placeholderQuotas,
+                tokensAvailable: false,
+                statusLabel: "同步中")
+        }
+
+        return AgentUsage(
+            available: true, todayInputTokens: 0, todayOutputTokens: 0,
+            secondsSinceActive: age, project: "Antigravity",
+            activity: state.activitySummary ?? "Pro 套餐额度 · 本地实时读取",
+            quotas: state.quotas,
+            tokensAvailable: false,
+            statusLabel: nil)
     }
 
     // MARK: - Codex

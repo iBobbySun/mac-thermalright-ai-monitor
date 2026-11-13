@@ -18,24 +18,27 @@ Pikachu hops and crackles with CPU load, clock ticks.</sub>
 > Fork of [beret21/MacTR](https://github.com/beret21/MacTR), reworked around a central
 > **AI Agents** panel that tracks [Claude Code](https://claude.com/claude-code) and
 > [Codex](https://openai.com/codex) sessions in real time, plus
-> [OpenCode Zen](https://opencode.ai) / [Ollama](https://ollama.com) subscription usage.
+> [OpenCode Zen](https://opencode.ai) / [Ollama](https://ollama.com) / [Antigravity](https://antigravity.google) subscription usage.
 
 ## Highlights
 
 ### 🤖 AI Agents panel
-Reads your **local** Claude Code and Codex session logs (read-only) and — once an API key is
-configured — the OpenCode Zen and Ollama Cloud usage endpoints. Shows 1–2 agents at a time:
+Reads your **local** Claude Code and Codex session logs (read-only), the OpenCode Zen and
+Ollama Cloud usage endpoints (once their API keys are configured), and the Pro-plan quota of a
+running Antigravity IDE through its local service. Shows 1–2 agents at a time:
 
 - **Current project** and the **last thing it said** — Markdown tables in the message are
   rendered as real aligned tables, not raw `| … |` text.
 - **Plan / step progress** — `步骤 4/6` badge + a segmented progress bar, parsed from
   Codex `update_plan` and Claude `TodoWrite`. Stale plans from a finished turn disappear.
 - **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (Ollama shows a
-  trailing 24 h window; the OpenCode usage API reports no token counts, so that column shows `—`).
+  trailing 24 h window; the OpenCode and Antigravity endpoints report no token counts, so that
+  column shows `—`).
 - **Remaining quota** — Claude (5-hour / 7-day) and Codex (5-hour / 7-day) from local
   transcripts, OpenCode (rolling / weekly / monthly) from its usage API, Ollama (monthly
-  credits, or session / weekly on legacy plans) from `/api/balance`; each with the remaining
-  % and reset time.
+  credits, or session / weekly on legacy plans) from `/api/balance`, and Antigravity's five
+  windows (Gemini and Claude+GPT, each 5-hour + weekly, plus Argon weekly) from its local
+  language server; each with the remaining % and reset time.
 - **Live status** — the column **breathes** while an agent is working and **flashes** for
   ~10 s when it finishes a turn or needs your input.
 
@@ -110,6 +113,8 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 "$MACTR_BUILD_DIR/release/MacTR" --opencode-usage # diagnostics: OpenCode key status + rolling/weekly/monthly windows
 "$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # diagnostics: Ollama key status + live quota / last-24h usage
 "$MACTR_BUILD_DIR/release/MacTR" --ollama-parse balance|usage @body.json   # offline parser check (no network)
+"$MACTR_BUILD_DIR/release/MacTR" --antigravity-usage   # diagnostics: discover the language server + read the quota
+"$MACTR_BUILD_DIR/release/MacTR" --antigravity-parse @body.json   # offline quota parser check (no network)
 ```
 
 Only one process can hold the USB device at a time — stop the running instance before
@@ -119,8 +124,9 @@ using `--demo` / `--benchmark`.
 
 Apart from the sources below, MacTR does not talk to any network or API. This fork removes
 the Sparkle auto-updater; Claude / Codex only read the local transcripts those CLIs already
-write to disk, and the OpenCode / Ollama usage is **optional** — each is only queried after
-you enter its API key in Settings.
+write to disk, the OpenCode / Ollama usage is **optional** — each is only queried after you
+enter its API key in Settings — and Antigravity's quota is read **locally** from its own
+language server, never through a third-party service.
 
 | Agent | Source | What's parsed |
 |---|---|---|
@@ -128,6 +134,7 @@ you enter its API key in Settings.
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent messages, `token_count`, `rate_limits`, `update_plan` |
 | OpenCode | `GET https://opencode.ai/zen/go/v1/usage` (Bearer API key, optional) | rolling / weekly / monthly usage % and reset times |
 | Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h` (Bearer API key, optional) | monthly credits (or legacy session/weekly), last-24h tokens / requests / spend |
+| Antigravity | local language server `RetrieveUserQuotaSummary` (loopback Connect-RPC, IDE must be running) | 5-hour + weekly quota for the Gemini / Claude+GPT / Argon model groups and their reset times |
 
 Token totals are scoped to the local day; the panel gracefully shows the last session's
 context when an agent hasn't run yet today.
@@ -160,17 +167,33 @@ context when an agent hasn't run yet today.
 5. Tokens are a **trailing 24 h** window (the only window the API offers), so the caption reads
    "近24h Token" instead of "Today token".
 
+### Antigravity usage (no setup)
+
+1. **No API key and no account credentials are needed.** Antigravity signs in with a Google
+   account and only its own local service can see the quota. MacTR finds the running
+   `language_server` process, reads the one-shot CSRF token from its arguments, and calls the
+   Connect-RPC `RetrieveUserQuotaSummary` on `127.0.0.1`.
+2. The card shows **all five windows**: `Gemini 5小时`, `Gemini 周`, `Claude/GPT 5小时`,
+   `Claude/GPT 周` and `Argon 周`, each with its remaining %, reset time and bar. The compact
+   vertical card switches to a dense row style (13 pt labels, 3 px bars) so five rows fit.
+3. When Antigravity is not running the card says "未运行" and nothing is requested; starting
+   the IDE brings it back within 60 s (success 60 s / failure 15 s refresh cadence).
+4. That endpoint only reports fractions, so the card drops the token block entirely (same
+   as OpenCode) and gives the room to the quota rows and activity line.
+
 ### Which agents the dashboard shows
 
-Tick Claude / Codex / OpenCode / Ollama in **Settings → Agents** — **at most 2 are shown at once**
+Tick Claude / Codex / OpenCode / Ollama / Antigravity in **Settings → Agents** — **at most 2 are shown at once**
 (the remaining toggles are disabled once two are selected). Orientation still lives in
 **Settings → Display**.
 
 ## Privacy
 
 Apart from the optional OpenCode / Ollama lookups, everything is local and read-only: no
-telemetry, no third-party network calls. There are exactly two kinds of outbound request, each
-carrying only its own key as an `Authorization: Bearer` header and no local data at all:
+telemetry, no third-party network calls. Antigravity's quota is read entirely over the
+`127.0.0.1` loopback and never leaves the machine. There are exactly two kinds of outbound
+request, each carrying only its own key as an `Authorization: Bearer` header and no local data
+at all:
 
 - with an OpenCode key configured, `GET https://opencode.ai/zen/go/v1/usage` once every 60 s;
 - with an Ollama key configured, `GET https://ollama.com/api/balance` and

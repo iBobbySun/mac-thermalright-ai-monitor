@@ -14,17 +14,17 @@
 
 > 基于 [beret21/MacTR](https://github.com/beret21/MacTR) 改造,核心是一块实时追踪
 > [Claude Code](https://claude.com/claude-code)、[Codex](https://openai.com/codex)
-> 会话以及 [OpenCode Zen](https://opencode.ai) / [Ollama](https://ollama.com) 订阅额度的 **AI Agents** 面板。
+> 会话以及 [OpenCode Zen](https://opencode.ai) / [Ollama](https://ollama.com) / [Antigravity](https://antigravity.google) 订阅额度的 **AI Agents** 面板。
 
 ## 亮点
 
 ### 🤖 AI Agents 面板
-读取**本地**的 Claude Code / Codex 会话日志(只读),并在配置 API Key 后读取 OpenCode Zen 与 Ollama Cloud 的用量,同屏显示 1–2 个 agent 的:
+读取**本地**的 Claude Code / Codex 会话日志(只读),在配置 API Key 后读取 OpenCode Zen 与 Ollama Cloud 的用量,并从 Antigravity 正在运行的本地服务读取 Pro 额度,同屏显示 1–2 个 agent 的:
 
 - **当前项目**和**它最后说的话** —— 消息里的 Markdown 表格会被渲染成对齐的表格,而不是原始的 `| … |` 文本。
 - **计划 / 步骤进度** —— `步骤 4/6` 徽章 + 分段进度条,从 Codex 的 `update_plan` 和 Claude 的 `TodoWrite` 解析而来。上一轮已完成的旧计划会自动消失。
-- **今日 Token 用量** —— 总量 + In/Out,用简洁的 `万 / 亿` 格式(Ollama 显示近 24 小时窗口;OpenCode 用量接口不返回 token,显示 `—`)。
-- **剩余额度** —— Claude(5 小时 / 7 天)与 Codex(5 小时 / 7 天)来自本地会话记录,OpenCode(滚动 / 周 / 月)来自其用量接口,Ollama(本月额度,或 legacy 套餐的会话 / 周)来自 `/api/balance`;统一显示剩余百分比 + 重置时间。
+- **今日 Token 用量** —— 总量 + In/Out,用简洁的 `万 / 亿` 格式(Ollama 显示近 24 小时窗口;OpenCode 与 Antigravity 的接口不返回 token,显示 `—`)。
+- **剩余额度** —— Claude(5 小时 / 7 天)与 Codex(5 小时 / 7 天)来自本地会话记录,OpenCode(滚动 / 周 / 月)来自其用量接口,Ollama(本月额度,或 legacy 套餐的会话 / 周)来自 `/api/balance`,Antigravity 的 5 个窗口(Gemini、Claude+GPT 各有 5 小时 + 周,加 Argon 周)来自其本地 language server;统一显示剩余百分比 + 重置时间。
 - **实时状态** —— agent 工作时该栏**缓慢呼吸**,完成一轮或需要你输入时**闪烁**约 10 秒提醒。
 
 ### 🖥️ 系统面板
@@ -93,13 +93,15 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 "$MACTR_BUILD_DIR/release/MacTR" --opencode-usage # 诊断:打印 OpenCode Key 状态与滚动/周/月三个窗口
 "$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # 诊断:打印 Ollama Key 状态与实时额度 / 近24h 用量
 "$MACTR_BUILD_DIR/release/MacTR" --ollama-parse balance|usage @body.json   # 离线校验解析器(不联网)
+"$MACTR_BUILD_DIR/release/MacTR" --antigravity-usage   # 诊断:发现本地 language server 并读取 Antigravity 额度
+"$MACTR_BUILD_DIR/release/MacTR" --antigravity-parse @body.json   # 离线校验额度解析器(不联网)
 ```
 
 同一时刻只能有一个进程占用 USB 设备 —— 用 `--demo` / `--benchmark` 前先停掉正在运行的实例。
 
 ## Agent 数据怎么读取
 
-除了下面这张表里的来源,MacTR 不访问任何网络或 API(本 fork 已移除 Sparkle 自动更新组件)。Claude / Codex 只读取它们本来就写到本地磁盘的会话记录;OpenCode 与 Ollama 的用量是**可选**的,只有在设置里填入各自的 API Key 后才会查询。
+除了下面这张表里的来源,MacTR 不访问任何网络或 API(本 fork 已移除 Sparkle 自动更新组件)。Claude / Codex 只读取它们本来就写到本地磁盘的会话记录;OpenCode 与 Ollama 的用量是**可选**的,只有在设置里填入各自的 API Key 后才会查询;Antigravity 的额度**只在本地**通过它自己的 language server 读取,不经过任何第三方服务。
 
 | Agent | 来源 | 解析内容 |
 |---|---|---|
@@ -107,6 +109,7 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent 消息、`token_count`、`rate_limits`、`update_plan` |
 | OpenCode | `GET https://opencode.ai/zen/go/v1/usage`(Bearer API Key,可选) | 滚动 / 周 / 月额度百分比与重置时间 |
 | Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h`(Bearer API Key,可选) | 本月额度(或 legacy 会话/周)、近 24h token / 请求数 / 花费 |
+| Antigravity | 本地 language server `RetrieveUserQuotaSummary`(loopback Connect-RPC,需 IDE 运行) | Gemini / Claude+GPT / Argon 模型组的 5 小时 + 周额度与重置时间 |
 
 Token 总量按本地自然日统计;某个 agent 今天还没跑过时,面板会优雅地显示它上一次会话的上下文。
 
@@ -125,13 +128,20 @@ Token 总量按本地自然日统计;某个 agent 今天还没跑过时,面板�
 4. 额度按套餐形态自动适配:新的 credits 套餐显示「额度 剩余 %」(由 `balance_usd / allowance_usd` 换算)+ 本期重置时间;legacy 套餐显示「会话 / 周」两条。已购余额与近 24h 花费显示在活动行。
 5. Token 统计口径是**近 24 小时**(接口只提供滚动窗口),所以该栏标题显示「近24h Token」而不是「今日 Token」。
 
+### Antigravity 用量(免配置)
+
+1. **不需要任何 API Key**,也不需要登录信息:Antigravity 以 Google 账号登录,额度只对它自己的本地服务可见。MacTR 会找到正在运行的 `language_server` 进程,从它的启动参数取一次性 CSRF token,再向 `127.0.0.1` 上的 Connect-RPC `RetrieveUserQuotaSummary` 读取额度。
+2. 卡片显示 **全部 5 个窗口**:`Gemini 5小时`、`Gemini 周`、`Claude/GPT 5小时`、`Claude/GPT 周`、`Argon 周`,每条都是剩余百分比 + 重置时间 + 进度条;竖屏紧凑卡用「密集行」样式(13 pt 标签 + 3 px 条)保证 5 行不越界。活动行显示模型组概览。
+3. Antigravity 没运行时卡片显示「未运行」,不会发起任何请求;启动 IDE 后最多 60 秒自动恢复。刷新节奏为成功 60 秒 / 失败 15 秒。
+4. 该接口只给百分比,没有 token 数,因此该栏不显示 Token 区块(OpenCode 同样处理),把空间留给额度和活动行。
+
 ### 仪表盘显示哪些 Agent
 
-**设置 → Agents** 里勾选 Claude / Codex / OpenCode / Ollama,**最多同时显示 2 个**(已选满 2 个时其余选项会被禁用);布局方向仍在 **设置 → Display** 里切换。
+**设置 → Agents** 里勾选 Claude / Codex / OpenCode / Ollama / Antigravity,**最多同时显示 2 个**(已选满 2 个时其余选项会被禁用);布局方向仍在 **设置 → Display** 里切换。
 
 ## 隐私
 
-除可选的 OpenCode / Ollama 用量查询外,一切都在本地、只读:无遥测、无第三方网络请求。外发请求只有两种,且各自以对应 agent 的 Key 作为 `Authorization: Bearer` 头,不发送任何本机数据:
+除可选的 OpenCode / Ollama 用量查询外,一切都在本地、只读:无遥测、无第三方网络请求。Antigravity 的额度读取全程走 `127.0.0.1` 回环,不经过外网。外发请求只有两种,且各自以对应 agent 的 Key 作为 `Authorization: Bearer` 头,不发送任何本机数据:
 
 - 配置 OpenCode Key 后,每 60 秒一次 `GET https://opencode.ai/zen/go/v1/usage`;
 - 配置 Ollama Key 后,每 60 秒一次 `GET https://ollama.com/api/balance` 与一次 `GET https://ollama.com/api/usage?range=24h`。

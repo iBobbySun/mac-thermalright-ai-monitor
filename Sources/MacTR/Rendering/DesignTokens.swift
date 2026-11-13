@@ -42,6 +42,9 @@ enum Color {
     /// clearly distinct from Codex cyan, OpenCode magenta and Claude terracotta.
     /// Kept as its own symbol so the tint can be changed in one place.
     static let ollama = CGColor(red: 154/255, green: 205/255, blue: 255/255, alpha: 1)
+    /// Antigravity (Google's agent IDE) is a multi-hue brand; lime keeps it visually
+    /// apart from Codex cyan, OpenCode magenta, Claude terracotta and Ollama blue.
+    static let antigravity = CGColor(red: 163/255, green: 230/255, blue: 53/255, alpha: 1)
 
     static let barBG = CGColor(red: 30/255, green: 34/255, blue: 48/255, alpha: 1)
 
@@ -88,6 +91,7 @@ enum AgentKind: String, CaseIterable, Identifiable, Sendable {
     case codex
     case opencode
     case ollama
+    case antigravity
 
     var id: String { rawValue }
 
@@ -98,11 +102,12 @@ enum AgentKind: String, CaseIterable, Identifiable, Sendable {
         case .codex: return "Codex"
         case .opencode: return "OpenCode"
         case .ollama: return "Ollama"
+        case .antigravity: return "Antigravity"
         }
     }
 
     /// Declaration order — it decides the on-screen column order
-    /// (claude → codex → opencode → ollama).
+    /// (claude → codex → opencode → ollama → antigravity).
     var sortIndex: Int { Self.allCases.firstIndex(of: self) ?? 0 }
 }
 

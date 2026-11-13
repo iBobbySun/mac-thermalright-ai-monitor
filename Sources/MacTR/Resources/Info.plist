@@ -11,11 +11,17 @@
 	<key>CFBundleName</key>
 	<string>MacTR</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.5.0</string>
+	<string>1.6.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.5.0</string>
+	<string>1.6.0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- Antigravity's local language server answers plain HTTP on loopback. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>LSUIElement</key>
 	<false/>
 	<key>NSHighResolutionCapable</key>

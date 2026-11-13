@@ -120,6 +120,21 @@ struct MacTREntry {
             return
         }
 
+        // Antigravity quota diagnostics: discover the local language server and read
+        // the Pro-plan quota over loopback (no key, no OAuth token).
+        // Usage: --antigravity-usage
+        if CommandLine.arguments.contains("--antigravity-usage") {
+            runAntigravityUsageProbe()
+            return
+        }
+
+        // Offline parser check for a RetrieveUserQuotaSummary payload.
+        // Usage: --antigravity-parse '<json>' | @file.json
+        if CommandLine.arguments.contains("--antigravity-parse") {
+            runAntigravityParseCheck()
+            return
+        }
+
         // Snapshot mode: render one frame and save as PNG
         // Usage: --snapshot path.png [--cores N]
         if CommandLine.arguments.contains("--snapshot") {            let renderer = MonitorRenderer()
@@ -619,7 +634,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let window = NSWindow(contentViewController: hostingController)
         window.title = "MacTR Settings"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 500, height: 680))
+        window.setContentSize(NSSize(width: 500, height: 800))
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -1201,6 +1216,60 @@ private func runOllamaParseCheck() {
         }
     default:
         print("[Ollama] first argument must be 'balance' or 'usage', got '\(kind)'")
+    }
+}
+
+// MARK: - Antigravity Diagnostics
+
+/// Discover the running Antigravity language server and print its quota verdict.
+/// Never prints the CSRF token it extracts from the process arguments.
+private func runAntigravityUsageProbe() {
+    print("[Antigravity] discovering language_server + loopback RPC …")
+    let box = VerdictBox()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        box.set(await AntigravityUsageClient.probe())
+        semaphore.signal()
+    }
+    if semaphore.wait(timeout: .now() + 20) == .timedOut {
+        print("[Antigravity] ❌ 探测超时")
+        return
+    }
+    print("[Antigravity] \(box.value)")
+}
+
+/// Parse a `RetrieveUserQuotaSummary` payload without touching the network.
+private func runAntigravityParseCheck() {
+    let args = CommandLine.arguments
+    guard let source = parseStringFlag(args, flag: "--antigravity-parse") else {
+        print("[Antigravity] usage: --antigravity-parse '<json>' | @file.json")
+        return
+    }
+
+    let json: String
+    if source.hasPrefix("@") {
+        let path = String(source.dropFirst())
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            print("[Antigravity][ERROR] cannot read \(path)")
+            return
+        }
+        json = contents
+    } else {
+        json = source
+    }
+
+    switch AntigravityUsageClient.parse(Data(json.utf8)) {
+    case .success(let snapshot):
+        print("[Antigravity] groups: \(snapshot.groupNames.joined(separator: " / "))")
+        for quota in snapshot.quotas {
+            let used = quota.usedPercent.map { String(format: "%.0f%%", $0) } ?? "—"
+            let remaining = quota.usedPercent.map { String(format: "%.0f%%", 100 - $0) } ?? "—"
+            let reset = quota.resetsAt.map { ISO8601DateFormatter().string(from: $0) } ?? "no reset"
+            print("  \(quota.windowLabel): used \(used) · remaining \(remaining) · reset \(reset)")
+        }
+        print("  activity: \(snapshot.activitySummary ?? "—")")
+    case .failure(let error):
+        print("[Antigravity] parse failure: \(error.shortLabel) — \(error.message)")
     }
 }
 
