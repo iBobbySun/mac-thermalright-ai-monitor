@@ -31,9 +31,9 @@ running Antigravity IDE through its local service. Shows 1–2 agents at a time:
   rendered as real aligned tables, not raw `| … |` text.
 - **Plan / step progress** — `步骤 4/6` badge + a segmented progress bar, parsed from
   Codex `update_plan` and Claude `TodoWrite`. Stale plans from a finished turn disappear.
-- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (Ollama shows a
-  trailing 24 h window; the OpenCode and Antigravity endpoints report no token counts, so that
-  column shows `—`).
+- **Today's token usage** — total + In/Out, in a compact `万 / 亿` format (Ollama sums its
+  hourly usage buckets into the local calendar day; the OpenCode and Antigravity endpoints
+  report no token counts, so that column shows `—`).
 - **Remaining quota** — Claude (5-hour / 7-day) and Codex (5-hour / 7-day) from local
   transcripts, OpenCode (rolling / weekly / monthly) from its usage API, Ollama (monthly
   credits, or session / weekly on legacy plans) from `/api/balance`, and Antigravity's five
@@ -111,7 +111,7 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 "$MACTR_BUILD_DIR/release/MacTR" --gif x.gif --frames 48 --fps 12 --scale 2   # animated demo GIF
 "$MACTR_BUILD_DIR/release/MacTR" --benchmark 120 # measure achievable LCD frame rate
 "$MACTR_BUILD_DIR/release/MacTR" --opencode-usage # diagnostics: OpenCode key status + rolling/weekly/monthly windows
-"$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # diagnostics: Ollama key status + live quota / last-24h usage
+"$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # diagnostics: Ollama key status + live quota / today's usage
 "$MACTR_BUILD_DIR/release/MacTR" --ollama-parse balance|usage @body.json   # offline parser check (no network)
 "$MACTR_BUILD_DIR/release/MacTR" --antigravity-usage   # diagnostics: discover the language server + read the quota
 "$MACTR_BUILD_DIR/release/MacTR" --antigravity-parse @body.json   # offline quota parser check (no network)
@@ -133,7 +133,7 @@ language server, never through a third-party service.
 | Claude Code | `~/.claude/projects/*/*.jsonl` | assistant messages, `usage` tokens, `TodoWrite` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent messages, `token_count`, `rate_limits`, `update_plan` |
 | OpenCode | `GET https://opencode.ai/zen/go/v1/usage` (Bearer API key, optional) | rolling / weekly / monthly usage % and reset times |
-| Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h` (Bearer API key, optional) | monthly credits (or legacy session/weekly), last-24h tokens / requests / spend |
+| Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h` (Bearer API key, optional) | monthly credits (or legacy session/weekly), today's (local calendar day) tokens / requests / spend |
 | Antigravity | local language server `RetrieveUserQuotaSummary` (loopback Connect-RPC, IDE must be running) | 5-hour + weekly quota for the Gemini / Claude+GPT / Argon model groups and their reset times |
 
 Token totals are scoped to the local day; the panel gracefully shows the last session's
@@ -163,9 +163,10 @@ context when an agent hasn't run yet today.
    official 10 requests/minute limit); a 429 is honoured via `Retry-After` with backoff.
 4. The quota row adapts to the plan: credit plans show "额度 剩余 %" (from
    `balance_usd / allowance_usd`) plus the period reset; legacy plans show session / weekly.
-   Purchased balance and last-24h spend appear in the activity line.
-5. Tokens are a **trailing 24 h** window (the only window the API offers), so the caption reads
-   "近24h Token" instead of "Today token".
+   Purchased balance and today's spend appear in the activity line.
+5. Tokens follow the **local calendar day (00:00–24:00)**: the API returns hourly buckets and
+   the app sums only the buckets that start today, so the caption reads "今天 Token". The
+   rolling 24 h window always covers today so far, so no hour of today is missing.
 
 ### Antigravity usage (no setup)
 

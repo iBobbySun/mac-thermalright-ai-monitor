@@ -1209,7 +1209,7 @@ private func runOllamaParseCheck() {
         switch OllamaUsageClient.parseUsage(data) {
         case .success(let totals):
             let cost = totals.costUSD.map { String(format: "$%.5f", $0) } ?? "—"
-            print("[Ollama] usage totals: \(totals.requestCount) request(s)"
+            print("[Ollama] usage today: \(totals.requestCount) request(s)"
                   + " · in \(totals.inputTokens) / out \(totals.outputTokens) · cost \(cost)")
         case .failure(let error):
             print("[Ollama] usage parse failure: \(error.shortLabel) — \(error.message)")

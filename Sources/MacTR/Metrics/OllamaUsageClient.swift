@@ -5,7 +5,7 @@
 // One refresh therefore asks two endpoints:
 //
 //   GET https://ollama.com/api/balance            (remaining credits / plan limits)
-//   GET https://ollama.com/api/usage?range=24h    (requests, tokens, spend)
+//   GET https://ollama.com/api/usage?range=24h    (hourly buckets: requests, tokens, spend)
 //   Authorization: Bearer <api key>
 //
 // Canonical balance (credit plan — docs.ollama.com/api/balance):
@@ -17,8 +17,17 @@
 //                "weekly":{"remaining_percent":40,"resets_at":"...Z"}},
 //    "purchased":{"balance_usd":25}}
 // Canonical usage:
-//   {"range":"24h","totals":{"request_count":15,"usage_usd":0.01718,
-//    "input_tokens":106000,"cached_input_tokens":46000,"output_tokens":13600},...}
+//   {"range":"24h","granularity":"hour","from":"...Z","until":"...Z",
+//    "totals":{"request_count":15,"usage_usd":0.01718,
+//              "input_tokens":106000,"cached_input_tokens":46000,"output_tokens":13600},
+//    "buckets":[{"from":"...Z","until":"...Z","request_count":…,"usage_usd":…,
+//                "input_tokens":…,"cached_input_tokens":…,"output_tokens":…}, …]}
+// The dashboard's token row is the LOCAL calendar day (today 00:00–24:00), not the
+// rolling 24 h `totals`: the hourly `buckets` are summed for the hours that start
+// inside today. A trailing 24 h window always begins before local midnight, so every
+// hour of today so far is present. Buckets are aligned to UTC hours, which makes the
+// sum exact for whole-hour zones (e.g. Asia/Shanghai); in a fractional-offset zone
+// the one bucket straddling local midnight is attributed to the day it starts in.
 // Unauthorized (verified live against a bogus key):
 //   {"error":"invalid credentials"}   ← `error` is a STRING here, not an object
 //
@@ -92,7 +101,8 @@ struct OllamaBalance: Sendable {
     let purchasedUSD: Double?
 }
 
-/// `GET /api/usage?range=24h` totals.
+/// Today's totals (local 00:00–24:00), summed from the hourly buckets of
+/// `GET /api/usage?range=24h`.
 struct OllamaUsageTotals: Sendable {
     let inputTokens: UInt64
     let outputTokens: UInt64
@@ -461,19 +471,56 @@ final class OllamaUsageClient: @unchecked Sendable {
                                       remainingUSD: remaining, purchasedUSD: purchased))
     }
 
-    /// Parses `/api/usage?range=24h` totals. Missing counters read as 0, not a failure.
-    static func parseUsage(_ data: Data) -> Result<OllamaUsageTotals, OllamaUsageError> {
+    /// Parses `/api/usage?range=24h` and sums the hourly buckets that start inside
+    /// today's local calendar day. `now`/`calendar` are injectable for diagnostics.
+    ///
+    /// `granularity` must be `hour`: day buckets are aligned to UTC days and cannot
+    /// be split at a local midnight, so summing them would misstate "today". Missing
+    /// or malformed individual buckets are skipped; a payload without the hourly
+    /// series is a decoding failure rather than a silently wrong number.
+    static func parseUsage(_ data: Data, now: Date = Date(),
+                           calendar: Calendar = .current)
+        -> Result<OllamaUsageTotals, OllamaUsageError> {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return .failure(.decoding)
         }
         if let error = errorEnvelope(root) { return .failure(error) }
-        guard let totals = root["totals"] as? [String: Any] else { return .failure(.decoding) }
+        guard root["granularity"] as? String == "hour",
+              let buckets = root["buckets"] as? [[String: Any]]
+        else { return .failure(.decoding) }
 
+        let dayStart = calendar.startOfDay(for: now)
+        guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart),
+              dayEnd > dayStart
+        else { return .failure(.decoding) }
+
+        var inputTokens: UInt64 = 0
+        var outputTokens: UInt64 = 0
+        var requestCount = 0.0
+        var costUSD: Double?
+        for bucket in buckets {
+            guard let start = resetDate(bucket["from"]),
+                  start >= dayStart, start < dayEnd
+            else { continue }
+            inputTokens = saturatingAdd(inputTokens, tokenCount(bucket["input_tokens"]))
+            outputTokens = saturatingAdd(outputTokens, tokenCount(bucket["output_tokens"]))
+            requestCount += max(0, number(bucket["request_count"]) ?? 0)
+            if let cost = number(bucket["usage_usd"]) {
+                costUSD = (costUSD ?? 0) + cost
+            }
+        }
+
+        let totalRequests = requestCount >= Double(Int.max) ? Int.max : Int(requestCount)
         return .success(OllamaUsageTotals(
-            inputTokens: tokenCount(totals["input_tokens"]),
-            outputTokens: tokenCount(totals["output_tokens"]),
-            requestCount: Int(number(totals["request_count"]) ?? 0),
-            costUSD: number(totals["usage_usd"])))
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            requestCount: totalRequests,
+            costUSD: costUSD))
+    }
+
+    private static func saturatingAdd(_ a: UInt64, _ b: UInt64) -> UInt64 {
+        let (sum, overflow) = a.addingReportingOverflow(b)
+        return overflow ? UInt64.max : sum
     }
 
     /// Legacy plans report what REMAINS; the dashboard stores what is USED.
@@ -563,7 +610,7 @@ final class OllamaUsageClient: @unchecked Sendable {
                 parts.append("\(quota.windowLabel)剩余 \(Int((100 - used).rounded()))%")
             }
             if snapshot.tokensAvailable {
-                parts.append("近24h In \(compactTokens(snapshot.inputTokens))"
+                parts.append("今天 In \(compactTokens(snapshot.inputTokens))"
                              + " / Out \(compactTokens(snapshot.outputTokens))")
             }
             if let purchased = snapshot.purchasedUSD, purchased > 0 {

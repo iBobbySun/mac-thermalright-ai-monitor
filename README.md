@@ -91,7 +91,7 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 "$MACTR_BUILD_DIR/release/MacTR" --gif x.gif --frames 48 --fps 12 --scale 2   # 生成演示 GIF
 "$MACTR_BUILD_DIR/release/MacTR" --benchmark 120 # 测量 LCD 可达帧率
 "$MACTR_BUILD_DIR/release/MacTR" --opencode-usage # 诊断:打印 OpenCode Key 状态与滚动/周/月三个窗口
-"$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # 诊断:打印 Ollama Key 状态与实时额度 / 近24h 用量
+"$MACTR_BUILD_DIR/release/MacTR" --ollama-usage   # 诊断:打印 Ollama Key 状态与实时额度 / 今天用量
 "$MACTR_BUILD_DIR/release/MacTR" --ollama-parse balance|usage @body.json   # 离线校验解析器(不联网)
 "$MACTR_BUILD_DIR/release/MacTR" --antigravity-usage   # 诊断:发现本地 language server 并读取 Antigravity 额度
 "$MACTR_BUILD_DIR/release/MacTR" --antigravity-parse @body.json   # 离线校验额度解析器(不联网)
@@ -108,7 +108,7 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 | Claude Code | `~/.claude/projects/*/*.jsonl` | 助手消息、`usage` token、`TodoWrite` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | agent 消息、`token_count`、`rate_limits`、`update_plan` |
 | OpenCode | `GET https://opencode.ai/zen/go/v1/usage`(Bearer API Key,可选) | 滚动 / 周 / 月额度百分比与重置时间 |
-| Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h`(Bearer API Key,可选) | 本月额度(或 legacy 会话/周)、近 24h token / 请求数 / 花费 |
+| Ollama | `GET https://ollama.com/api/balance` + `/api/usage?range=24h`(Bearer API Key,可选) | 本月额度(或 legacy 会话/周)、今天(本地自然日)token / 请求数 / 花费 |
 | Antigravity | 本地 language server `RetrieveUserQuotaSummary`(loopback Connect-RPC,需 IDE 运行) | Gemini / Claude+GPT / Argon 模型组的 5 小时 + 周额度与重置时间 |
 
 Token 总量按本地自然日统计;某个 agent 今天还没跑过时,面板会优雅地显示它上一次会话的上下文。
@@ -125,8 +125,8 @@ Token 总量按本地自然日统计;某个 agent 今天还没跑过时,面板�
 1. 在 [ollama.com/settings/keys](https://ollama.com/settings/keys) 生成 API Key,打开 **设置 → Agents**,粘贴到 Ollama 一栏,点「保存并测试」。
 2. 加密方式与 OpenCode 完全一致(独立的随机 secret + salt → MD5 派生密钥 → AES-GCM),界面只显示 MD5 指纹前 8 位;清除后立即停止轮询。
 3. 每 60 秒并发请求 `/api/balance` 与 `/api/usage?range=24h`(共 2 次/分钟,远低于官方 10 次/分钟的限流),遇到 429 会按 `Retry-After` 自动退避。
-4. 额度按套餐形态自动适配:新的 credits 套餐显示「额度 剩余 %」(由 `balance_usd / allowance_usd` 换算)+ 本期重置时间;legacy 套餐显示「会话 / 周」两条。已购余额与近 24h 花费显示在活动行。
-5. Token 统计口径是**近 24 小时**(接口只提供滚动窗口),所以该栏标题显示「近24h Token」而不是「今日 Token」。
+4. 额度按套餐形态自动适配:新的 credits 套餐显示「额度 剩余 %」(由 `balance_usd / allowance_usd` 换算)+ 本期重置时间;legacy 套餐显示「会话 / 周」两条。已购余额与今天的花费显示在活动行。
+5. Token 统计口径是**本地自然日 00:00–24:00**:`/api/usage` 返回按小时分桶的数据,程序只汇总落在本地今天内的桶,因此该栏标题显示「今天 Token」。滚动 24 小时窗口总是覆盖今天至今,所以今天的桶不会缺失。
 
 ### Antigravity 用量(免配置)
 

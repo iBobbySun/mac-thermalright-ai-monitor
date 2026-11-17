@@ -1,5 +1,13 @@
 # TASK_STATE
 
+## 2026-11-17 Ollama 改为「今天 Token」（本地自然日 00:00–24:00）
+
+- 完成内容：Ollama 卡片的「近24h Token」改为「今天 Token」；Token / In / Out、活动行花费与请求数全部改为统计**本地自然日 00:00–24:00**（此前直接使用接口 `totals` 的滚动 24 小时）。版本 1.6.0 → 1.6.1。
+- 关键决策：`/api/usage?range=24h` 的响应自带 `granularity:"hour"` 的 `buckets`（每个桶含 from/until/request_count/usage_usd/input_tokens/cached_input_tokens/output_tokens，最后一个桶带 `partial`），因此不再读 `totals`，改为把 `from` 落在本地今天 `[startOfDay, 次日 0 点)` 的小时桶求和；滚动 24h 窗口的起点是「现在 − 24h」（昨天同一钟点），一定早于今天 0 点，所以今天已发生的每个小时都在窗口内；强制要求 `granularity == "hour"`——`range=7d/30d` 返回按 UTC 日分桶，无法在本地午夜切分，宁可报解析失败也不静默给出错误数字；桶按 UTC 整点对齐，整点时区（Asia/Shanghai）与本地午夜完全对齐、结果精确，非整点时区跨越本地午夜的那个桶归入其开始日（最多一个桶的误差），已在代码注释中说明；`now` / `calendar` 注入解析函数便于离线校验；单个桶字段畸形只跳过该桶，今天无桶时 token 显示 0、花费留空（活动行省略花费）。
+- 修改文件：`Sources/MacTR/Metrics/OllamaUsageClient.swift`（`parseUsage` 按本地自然日汇总 buckets、探测文案「今天 In/Out」、头部注释与 payload 说明）、`Sources/MacTR/Metrics/AgentUsageCollector.swift`（caption「今天 Token」、活动行「今天 $…」与注释）、`Sources/MacTR/Rendering/MonitorRenderer.swift`（demo 夹具）、`Sources/MacTR/App/MacTRApp.swift`（`--ollama-parse usage` 输出文案）、`Sources/MacTR/Resources/Info.plist`（1.6.1）、`README.md`、`README.en.md`、`TASK_STATE.md`。
+- 验证结果：release 构建通过；实网探测真实 Key 返回「✅ 已连通 · 额度剩余 82% · 今天 In 117.1M / Out 531K」；同一份真实 24h 响应按 Asia/Shanghai 本地日用 Python 独立求和（18 个桶：635 次请求 / in 115,715,730 / out 525,555 / $1.59181）与 `--ollama-parse usage` 输出完全一致；边界夹具：跨本地午夜的 4 个桶只取今天 2 个（5 请求 / in 50 / out 500 / $0.05）、畸形 `from` 与两天前的桶被跳过、`granularity:"day"` 判为解析失败、今天无桶时返回 0 且 cost 为空；`--snapshot` demo 渲染确认卡片标题为「今天 Token」、活动行「今天 $0.2418 · 42 次请求 · 已购余额 $25.00」，与 Claude 卡片无重叠越界。
+- 发布结果：新版 1.6.1 已替换安装至 `/Applications/MacTR.app` 并启动（PID 32641，进程路径 `/Applications/MacTR.app/Contents/MacOS/MacTR`）；安装包与本仓库 `dist/MacTR.app` 的 MacTR 二进制 SHA-256 均为 `fd1437fb9c050c055c3287322e76a450946559978110ecd0251753b8202c27c1`，`codesign --verify --deep --strict` 通过；替换前版本（1.6.0）保留为 `/Applications/MacTR-backup-20261117-174114.app`。
+
 ## 2026-11-13 接入 Antigravity（本地 language server 读 Pro 额度，全 5 个窗口）
 
 - 完成内容：新增第 5 个 agent「Antigravity」，**无需 API Key、不读 OAuth 凭据**——从 `ps` 找到正在运行的 `language_server`（`--app_data_dir antigravity` / `antigravity-ide`）取 `--csrf_token`，用 `lsof` 取其 loopback 端口，再 POST `http://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`（HTTP 优先、HTTPS 自签名兜底）读取 Pro 额度；卡片显示**全部 5 个窗口**（Gemini 5小时/周、Claude/GPT 5小时/周、Argon 周），竖屏紧凑卡新增「密集行」样式（13 pt 标签、3 px 条、22 pt 行距）容纳 5 行，横屏整栏卡对无 token 数据源移除空的 Token 区块把空间让给活动行；设置页只需勾选 agent（无 Key 录入区），窗口 680 → 800 以容纳 5 个开关 + 两个 Key 段落。版本 1.5.0 → 1.6.0。

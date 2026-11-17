@@ -36,8 +36,8 @@ struct AgentUsage: Sendable {
     let stepText: String?           // description of the active step
     let tokensAvailable: Bool       // false = the source exposes no token counts (OpenCode API)
     let statusLabel: String?        // overrides the right-aligned "now / 12m ago / not found" text
-    /// Replaces the hardcoded "今日 Token" caption when the token counters do not
-    /// cover a calendar day (Ollama reports a trailing 24 h window).
+    /// Replaces the hardcoded "今日 Token" caption when a source needs its own
+    /// wording (Ollama's counters cover the local calendar day and read "今天 Token").
     let tokenWindowCaption: String?
     var todayTotalTokens: UInt64 { todayInputTokens + todayOutputTokens }
 
@@ -797,7 +797,8 @@ final class AgentUsageCollector: @unchecked Sendable {
     // MARK: - Ollama (API-backed)
 
     /// Ollama Cloud exposes remaining credits over HTTPS (`/api/balance`) plus
-    /// trailing-24h totals (`/api/usage?range=24h`). The client refreshes itself in
+    /// hourly-bucketed usage (`/api/usage?range=24h`), which the client sums into
+    /// the local calendar day (today 00:00–24:00). The client refreshes itself in
     /// the background (60 s on success / 30 s on failure / 429 backoff), so this
     /// method only pays for a lock-guarded snapshot read.
     ///
@@ -810,7 +811,7 @@ final class AgentUsageCollector: @unchecked Sendable {
         ollamaClient.refreshIfNeeded()
         let state = ollamaClient.state()
         let age = state.lastSuccessAt.map { max(0, Int(Date().timeIntervalSince($0))) }
-        let caption = "近24h Token"
+        let caption = "今天 Token"
 
         guard state.isConfigured else {
             return AgentUsage(
@@ -862,7 +863,7 @@ final class AgentUsageCollector: @unchecked Sendable {
             tokenWindowCaption: caption)
     }
 
-    /// Compact activity line: 24 h spend, request count, purchased balance, and a
+    /// Compact activity line: today's spend, request count, purchased balance, and a
     /// note when only one of the two endpoints answered.
     private func ollamaActivity(_ snapshot: OllamaUsageSnapshot) -> String {
         var parts: [String] = []
@@ -870,10 +871,10 @@ final class AgentUsageCollector: @unchecked Sendable {
             if let cost = snapshot.costUSD {
                 if cost > 0 {
                     parts.append(cost < 1
-                                 ? String(format: "近24h $%.4f", cost)
-                                 : String(format: "近24h $%.2f", cost))
+                                 ? String(format: "今天 $%.4f", cost)
+                                 : String(format: "今天 $%.2f", cost))
                 } else {
-                    parts.append("近24h 无花费")
+                    parts.append("今天 无花费")
                 }
             }
             parts.append("\(snapshot.requestCount) 次请求")
